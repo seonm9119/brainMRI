@@ -1,0 +1,14 @@
+services:
+  brainmri:
+    build:
+      context: .
+    container_name: brainMRI
+    user: "${BRAINMRI_UID:-1000}:${BRAINMRI_GID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./brain_mri_3d_tumor_segmentation/sample:/app/brain_mri_3d_tumor_segmentation/sample:ro
+      - ./brain_mri_3d_tumor_segmentation/segmentation/assignment_3d_unet/checkpoints:/app/brain_mri_3d_tumor_segmentation/segmentation/assignment_3d_unet/checkpoints:ro
+      - ./brain_mri_3d_tumor_segmentation/nifti_cache:/app/brain_mri_3d_tumor_segmentation/nifti_cache
+      - ./brain_mri_3d_tumor_segmentation/segmentation_cache:/app/brain_mri_3d_tumor_segmentation/segmentation_cache
