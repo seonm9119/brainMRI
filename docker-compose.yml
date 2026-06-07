@@ -7,6 +7,9 @@ services:
     restart: unless-stopped
     ports:
       - "8010:8010"
+    environment:
+      - BRAINMRI_GPT_INTERPRETATION_API_URL=${BRAINMRI_GPT_INTERPRETATION_API_URL:-http://192.168.0.21:8003/brain-mri/segmentation/interpret}
+      - BRAINMRI_GPT_INTERPRETATION_TIMEOUT=${BRAINMRI_GPT_INTERPRETATION_TIMEOUT:-120}
     volumes:
       - ./brain_mri_3d_tumor_segmentation/sample:/app/brain_mri_3d_tumor_segmentation/sample:ro
       - ./brain_mri_3d_tumor_segmentation/segmentation/3d_unet/checkpoints:/app/brain_mri_3d_tumor_segmentation/segmentation/3d_unet/checkpoints:ro

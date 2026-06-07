@@ -1,4 +1,8 @@
+import json
+import os
 import shutil
+import urllib.error
+import urllib.request
 from importlib import import_module
 from pathlib import Path
 
@@ -22,8 +26,13 @@ ASSIGNMENT_CHECKPOINT_DIR = SEGMENTATION_DIR / "3d_unet" / "checkpoints"
 ENHANCED_CHECKPOINT_DIR = SEGMENTATION_DIR / "enhanced_model" / "checkpoints"
 SEGMENTATION_CACHE_DIR = SEGMENTATION_ROOT / "segmentation_cache"
 STATIC_SEGMENTATION_CACHE_PATH = "/static/segmentation-cache"
-PREDICTION_CACHE_VERSION = 1
 UNCERTAINTY_REGION_ID = "uncertainty"
+GPT_INTERPRETATION_API_URL = os.environ.get(
+    "BRAINMRI_GPT_INTERPRETATION_API_URL",
+    "http://192.168.0.21:8003/brain-mri/segmentation/interpret"
+).strip()
+GPT_INTERPRETATION_TIMEOUT = float(os.environ.get("BRAINMRI_GPT_INTERPRETATION_TIMEOUT", "120"))
+GPT_INTERPRETATION_MODEL_IDS = {"assignment"}
 REGION_LABELS = {
     "wt": "WT",
     "tc": "TC",
@@ -142,6 +151,8 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
 
     region_masks = create_region_masks(probabilities, model_config["threshold"])
     confidence_summary = create_confidence_summary(probabilities, region_masks, uncertainty_volume, model_config)
+    quantitative_summary = create_quantitative_summary(original_volume, probabilities, region_masks, uncertainty_volume, nifti_image)
+    llm_interpretation = create_llm_interpretation(selected_case, model_config, quantitative_summary)
 
     return {
         "affine": nifti_image.affine,
@@ -150,6 +161,8 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
         "regions": region_masks,
         "uncertainty": uncertainty_volume,
         "confidenceSummary": confidence_summary,
+        "quantitativeSummary": quantitative_summary,
+        "llmInterpretation": llm_interpretation,
         "probabilityRange": {
             "min": float(probabilities.min()),
             "max": float(probabilities.max())
@@ -293,6 +306,240 @@ def calculate_uncertain_voxel_ratio(uncertainty_volume, tumor_mask, uncertainty_
     return float(uncertain_voxels.sum() / tumor_mask.sum())
 
 
+def create_quantitative_summary(original_volume, probabilities, region_masks, uncertainty_volume, nifti_image):
+    brain_foreground_mask = create_brain_foreground_mask(original_volume)
+    tumor_mask = region_masks["combined"] > 0
+    brain_foreground_mask = np.logical_or(brain_foreground_mask, tumor_mask)
+    voxel_spacing_mm = [float(zoom) for zoom in nifti_image.header.get_zooms()[:3]]
+    voxel_volume_ml = calculate_voxel_volume_ml(voxel_spacing_mm)
+    brain_voxel_count = int(brain_foreground_mask.sum())
+    region_summaries = create_region_quantitative_summaries(
+        region_masks,
+        probabilities,
+        brain_voxel_count,
+        voxel_volume_ml
+    )
+    composition_summary = create_composition_summary(region_summaries, voxel_volume_ml)
+    probability_uncertainty = create_probability_uncertainty_summary(probabilities, tumor_mask)
+    tta_uncertainty = create_tta_uncertainty_summary(uncertainty_volume, tumor_mask)
+
+    return {
+        "method": "case-level quantitative summary from predicted WT/TC/ET masks",
+        "voxelSpacingMm": voxel_spacing_mm,
+        "voxelVolumeMl": voxel_volume_ml,
+        "brainForeground": {
+            "voxelCount": brain_voxel_count,
+            "volumeMl": brain_voxel_count * voxel_volume_ml
+        },
+        "regions": region_summaries,
+        "composition": composition_summary,
+        "uncertainty": {
+            "probability": probability_uncertainty,
+            "tta": tta_uncertainty
+        }
+    }
+
+
+def create_brain_foreground_mask(original_volume):
+    clean_volume = np.nan_to_num(original_volume, nan=0, posinf=0, neginf=0)
+
+    if clean_volume.ndim == 4:
+        return np.any(clean_volume > 0, axis=-1)
+
+    return clean_volume > 0
+
+
+def calculate_voxel_volume_ml(voxel_spacing_mm):
+    voxel_volume_mm3 = float(np.prod(voxel_spacing_mm))
+
+    return voxel_volume_mm3 / 1000
+
+
+def create_region_quantitative_summaries(region_masks, probabilities, brain_voxel_count, voxel_volume_ml):
+    probability_channel_by_region = {
+        "tc": 0,
+        "wt": 1,
+        "et": 2
+    }
+    region_summaries = {}
+
+    for region_id in ("wt", "tc", "et"):
+        region_mask = region_masks[region_id].astype(bool)
+        region_voxel_count = int(region_mask.sum())
+        probability_channel = probability_channel_by_region[region_id]
+        mean_probability = 0.0
+
+        if region_voxel_count:
+            mean_probability = float(probabilities[probability_channel][region_mask].mean())
+
+        region_summaries[region_id] = {
+            "label": REGION_LABELS[region_id],
+            "voxelCount": region_voxel_count,
+            "volumeMl": region_voxel_count * voxel_volume_ml,
+            "brainRatio": safe_ratio(region_voxel_count, brain_voxel_count),
+            "meanProbability": mean_probability
+        }
+
+    return region_summaries
+
+
+def create_composition_summary(region_summaries, voxel_volume_ml):
+    whole_tumor_voxels = region_summaries["wt"]["voxelCount"]
+    tumor_core_voxels = region_summaries["tc"]["voxelCount"]
+    enhancing_tumor_voxels = region_summaries["et"]["voxelCount"]
+    edema_related_voxels = max(whole_tumor_voxels - tumor_core_voxels, 0)
+    non_enhancing_core_voxels = max(tumor_core_voxels - enhancing_tumor_voxels, 0)
+
+    return {
+        "tcWtRatio": safe_ratio(tumor_core_voxels, whole_tumor_voxels),
+        "etTcRatio": safe_ratio(enhancing_tumor_voxels, tumor_core_voxels),
+        "etWtRatio": safe_ratio(enhancing_tumor_voxels, whole_tumor_voxels),
+        "edemaRelated": {
+            "voxelCount": edema_related_voxels,
+            "volumeMl": edema_related_voxels * voxel_volume_ml,
+            "wtRatio": safe_ratio(edema_related_voxels, whole_tumor_voxels)
+        },
+        "nonEnhancingCore": {
+            "voxelCount": non_enhancing_core_voxels,
+            "volumeMl": non_enhancing_core_voxels * voxel_volume_ml,
+            "tcRatio": safe_ratio(non_enhancing_core_voxels, tumor_core_voxels)
+        }
+    }
+
+
+def create_probability_uncertainty_summary(probabilities, tumor_mask):
+    region_uncertainty = 4 * probabilities * (1 - probabilities)
+    uncertainty_volume = region_uncertainty.max(axis=0).astype(np.float32)
+
+    return create_uncertainty_values(uncertainty_volume, tumor_mask, 0.5)
+
+
+def create_tta_uncertainty_summary(uncertainty_volume, tumor_mask):
+    if uncertainty_volume is None:
+        return None
+
+    return create_uncertainty_values(uncertainty_volume, tumor_mask, 0.08)
+
+
+def create_uncertainty_values(uncertainty_volume, tumor_mask, high_uncertainty_threshold):
+    if not tumor_mask.any():
+        return {
+            "mean": 0.0,
+            "max": 0.0,
+            "highRatio": 0.0,
+            "threshold": high_uncertainty_threshold
+        }
+
+    tumor_uncertainty = uncertainty_volume[tumor_mask]
+
+    return {
+        "mean": float(tumor_uncertainty.mean()),
+        "max": float(tumor_uncertainty.max()),
+        "highRatio": float((tumor_uncertainty >= high_uncertainty_threshold).sum() / tumor_uncertainty.size),
+        "threshold": high_uncertainty_threshold
+    }
+
+
+def safe_ratio(numerator, denominator):
+    if not denominator:
+        return 0.0
+
+    return float(numerator / denominator)
+
+
+def create_llm_interpretation(selected_case, model_config, quantitative_summary):
+    if model_config["id"] not in GPT_INTERPRETATION_MODEL_IDS:
+        return None
+
+    if not GPT_INTERPRETATION_API_URL:
+        return None
+
+    request_payload = {
+        "caseId": selected_case["caseId"],
+        "modelTitle": model_config["title"],
+        "quantitativeSummary": quantitative_summary,
+        "scoreContext": load_score_context(model_config["id"]),
+        "heatmapContext": load_heatmap_context(model_config["id"])
+    }
+
+    try:
+        request_body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+        api_request = urllib.request.Request(
+            GPT_INTERPRETATION_API_URL,
+            data=request_body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(api_request, timeout=GPT_INTERPRETATION_TIMEOUT) as api_response:
+            response_body = api_response.read().decode("utf-8")
+
+        return json.loads(response_body)
+    except urllib.error.HTTPError as http_error:
+        return create_llm_interpretation_error("http", http_error)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as api_error:
+        return create_llm_interpretation_error("network", api_error)
+
+
+def create_llm_interpretation_error(error_type, api_error):
+    error_message = str(api_error)
+
+    if isinstance(api_error, urllib.error.HTTPError):
+        try:
+            error_message = api_error.read().decode("utf-8")
+        except OSError:
+            error_message = str(api_error)
+
+    return {
+        "success": False,
+        "provider": "remote-gpt-api",
+        "cached": False,
+        "errorType": error_type,
+        "message": error_message
+    }
+
+
+def load_score_context(model_id):
+    score_path = SEGMENTATION_CACHE_DIR / model_id / "score" / "score_summary.json"
+
+    if not score_path.exists():
+        return {}
+
+    score_summary = read_json(score_path)
+    validation_regions = score_summary.get("splits", {}).get("val", {}).get("regions", {})
+    score_context = {}
+
+    for region_label in ("WT", "TC", "ET"):
+        region_score = validation_regions.get(region_label, {})
+        score_context[region_label] = {
+            "diceMean": region_score.get("diceMean"),
+            "hd95MeanMm": region_score.get("hd95MeanMm"),
+            "sensitivityMean": region_score.get("sensitivityMean"),
+            "absoluteVolumeErrorMeanPct": region_score.get("absoluteVolumeErrorMeanPct")
+        }
+
+    return {
+        "split": "validation",
+        "regions": score_context
+    }
+
+
+def load_heatmap_context(model_id):
+    heatmap_path = SEGMENTATION_CACHE_DIR / model_id / "heatmap" / "manifest.json"
+
+    if not heatmap_path.exists():
+        return {}
+
+    heatmap_manifest = read_json(heatmap_path)
+
+    return {
+        "caseId": heatmap_manifest.get("caseId"),
+        "meanUncertainty": heatmap_manifest.get("meanUncertainty"),
+        "maxUncertainty": heatmap_manifest.get("maxUncertainty"),
+        "uncertainVoxelRatio": heatmap_manifest.get("uncertainVoxelRatio")
+    }
+
+
 def load_model(model_config, checkpoint_info, torch):
     cache_key = f"{model_config['id']}:{checkpoint_info['path']}:{checkpoint_info['mtime']}"
 
@@ -361,7 +608,6 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
 
     uncertainty_info = save_uncertainty_cache(cache_dir, selected_case, model_config, prediction_data)
     prediction_manifest = {
-        "version": PREDICTION_CACHE_VERSION,
         "caseId": selected_case["caseId"],
         "fileName": selected_case["fileName"],
         "modelId": model_config["id"],
@@ -374,6 +620,8 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
         "regions": overlays,
         "regionCounts": region_counts,
         "confidenceSummary": prediction_data["confidenceSummary"],
+        "quantitativeSummary": prediction_data["quantitativeSummary"],
+        "llmInterpretation": prediction_data["llmInterpretation"],
         "uncertainty": uncertainty_info,
         "probabilityRange": prediction_data["probabilityRange"],
         "baseNifti": get_modality_nifti_response(selected_case["caseId"], "flair")
@@ -433,9 +681,6 @@ def is_prediction_manifest_ready(manifest_path, checkpoint_info):
         return False
 
     manifest = read_json(manifest_path)
-
-    if manifest.get("version") != PREDICTION_CACHE_VERSION:
-        return False
 
     if manifest.get("checkpoint", {}).get("signature") != checkpoint_info["signature"]:
         return False
