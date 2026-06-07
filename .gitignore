@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-training/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Data
+data/
+datasets/
+DecathlonDataset/
+gan_dataset/
+brain_mri_3d_tumor_segmentation/decathlon/
+brain_mri_3d_tumor_segmentation/nifti_cache/
+brain_mri_3d_tumor_segmentation/segmentation_cache/
+brain_mri_2d_slice_reconstruction/brain_2d/
+brain_mri_2d_slice_reconstruction/reconstruction_cache/
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.tar
+*.tar.gz
+*.zip
+
+# Model artifacts
+temp/
+checkpoints/
+weights/
+outputs/
+runs/
+*.pth
+*.pt
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
+
+AI5306-PS4-Segmentation-reconstruction.md
