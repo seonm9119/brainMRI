@@ -1,7 +1,5 @@
-import argparse
 import json
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -9,7 +7,6 @@ from monai.data import CacheDataset, DataLoader, decollate_batch, list_data_coll
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceFocalLoss
 from monai.metrics import DiceMetric
-from monai.networks.nets import UNet
 from monai.transforms import (
     Activations,
     AsDiscrete,
@@ -29,7 +26,7 @@ from monai.transforms import (
 from monai.utils import set_determinism
 from torch.amp import GradScaler, autocast
 
-from brain_mri_3d_tumor_segmentation.segmentation.assignment_3d_unet.data import (
+from brain_mri_3d_tumor_segmentation.segmentation.data import (
     ConvertBratsLabelToRegionsd,
     REGION_NAMES,
     load_decathlon_cases,
@@ -38,41 +35,8 @@ from brain_mri_3d_tumor_segmentation.segmentation.assignment_3d_unet.data import
 )
 
 
-SEGMENTATION_ROOT = Path(__file__).resolve().parents[2]
-ASSIGNMENT_MODEL_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = SEGMENTATION_ROOT / "decathlon"
-DEFAULT_OUTPUT_DIR = ASSIGNMENT_MODEL_DIR / "checkpoints" / "assignment_unet"
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train the assignment baseline 3D U-Net for BRATS segmentation.")
-    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--patch-size", type=int, nargs=3, default=(128, 128, 128))
-    parser.add_argument("--patches-per-case", type=int, default=2)
-    parser.add_argument("--sw-batch-size", type=int, default=2)
-    parser.add_argument("--overlap", type=float, default=0.5)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--train-case-limit", type=int)
-    parser.add_argument("--val-case-limit", type=int, default=16)
-    parser.add_argument("--val-interval", type=int, default=1)
-    parser.add_argument("--cache-rate", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--no-amp", action="store_true")
-
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
+def run_training(args, output_dir, create_model, model_name, model_title):
     set_seed(args.seed, args.deterministic)
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,12 +52,11 @@ def main():
     best_mean_dice = -1.0
     history = []
 
-    save_training_config(output_dir, args, train_count, val_count, device)
+    save_training_config(output_dir, args, model_name, model_title, train_count, val_count, device)
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp)
         scheduler.step()
-        should_validate = should_validate_epoch(epoch, args.epochs, args.val_interval)
         epoch_metrics = {
             "epoch": epoch,
             "trainLoss": train_loss,
@@ -104,7 +67,7 @@ def main():
         }
         is_best = False
 
-        if should_validate:
+        if should_validate_epoch(epoch, args.epochs, args.val_interval):
             val_metrics = validate(model, val_loader, criterion, dice_metric, post_prediction, device, args)
             mean_dice = val_metrics["meanDice"]
             is_best = mean_dice > best_mean_dice
@@ -116,43 +79,12 @@ def main():
 
         history.append(epoch_metrics)
         write_json(output_dir / "history.json", history)
-
-        save_checkpoint(output_dir / "latest_model.pth", model, optimizer, scheduler, args, epoch, val_metrics)
+        save_checkpoint(output_dir / "latest_model.pth", model, optimizer, scheduler, args, epoch, val_metrics, model_name)
 
         if is_best:
-            save_checkpoint(output_dir / "best_metric_model.pth", model, optimizer, scheduler, args, epoch, val_metrics)
+            save_checkpoint(output_dir / "best_metric_model.pth", model, optimizer, scheduler, args, epoch, val_metrics, model_name)
 
         print_training_progress(epoch, args.epochs, train_loss, val_metrics, best_mean_dice)
-
-
-def should_validate_epoch(epoch, total_epochs, val_interval):
-    interval = max(1, val_interval)
-
-    return epoch == 1 or epoch % interval == 0 or epoch == total_epochs
-
-
-def print_training_progress(epoch, total_epochs, train_loss, val_metrics, best_mean_dice):
-    if not val_metrics.get("validated", True):
-        print(
-            f"epoch={epoch:03d}/{total_epochs:03d} "
-            f"train_loss={train_loss:.5f} "
-            f"validation=skipped "
-            f"best={best_mean_dice:.4f}",
-            flush=True
-        )
-        return
-
-    print(
-        f"epoch={epoch:03d}/{total_epochs:03d} "
-        f"train_loss={train_loss:.5f} "
-        f"val_loss={val_metrics['valLoss']:.5f} "
-        f"dice_tc={val_metrics['diceTC']:.4f} "
-        f"dice_wt={val_metrics['diceWT']:.4f} "
-        f"dice_et={val_metrics['diceET']:.4f} "
-        f"mean_dice={val_metrics['meanDice']:.4f} "
-        f"best={best_mean_dice:.4f}",
-        flush=True
-    )
 
 
 def set_seed(seed, deterministic):
@@ -254,18 +186,6 @@ def create_val_transform(args):
     ])
 
 
-def create_model():
-    return UNet(
-        spatial_dims=3,
-        in_channels=4,
-        out_channels=3,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
-        norm="INSTANCE"
-    )
-
-
 def create_loss():
     return DiceFocalLoss(
         sigmoid=True,
@@ -330,6 +250,7 @@ def validate(model, val_loader, criterion, dice_metric, post_prediction, device,
     dice_metric.reset()
 
     return {
+        "validated": True,
         "valLoss": float(np.mean(losses)),
         "diceTC": float(dice_by_region[0]),
         "diceWT": float(dice_by_region[1]),
@@ -338,8 +259,40 @@ def validate(model, val_loader, criterion, dice_metric, post_prediction, device,
     }
 
 
-def save_training_config(output_dir, args, train_count, val_count, device):
+def should_validate_epoch(epoch, total_epochs, val_interval):
+    interval = max(1, val_interval)
+
+    return epoch == 1 or epoch % interval == 0 or epoch == total_epochs
+
+
+def print_training_progress(epoch, total_epochs, train_loss, val_metrics, best_mean_dice):
+    if not val_metrics.get("validated", True):
+        print(
+            f"epoch={epoch:03d}/{total_epochs:03d} "
+            f"train_loss={train_loss:.5f} "
+            f"validation=skipped "
+            f"best={best_mean_dice:.4f}",
+            flush=True
+        )
+        return
+
+    print(
+        f"epoch={epoch:03d}/{total_epochs:03d} "
+        f"train_loss={train_loss:.5f} "
+        f"val_loss={val_metrics['valLoss']:.5f} "
+        f"dice_tc={val_metrics['diceTC']:.4f} "
+        f"dice_wt={val_metrics['diceWT']:.4f} "
+        f"dice_et={val_metrics['diceET']:.4f} "
+        f"mean_dice={val_metrics['meanDice']:.4f} "
+        f"best={best_mean_dice:.4f}",
+        flush=True
+    )
+
+
+def save_training_config(output_dir, args, model_name, model_title, train_count, val_count, device):
     config = vars(args).copy()
+    config["modelName"] = model_name
+    config["modelTitle"] = model_title
     config["dataDir"] = str(config["data_dir"])
     config["outputDir"] = str(config["output_dir"])
     config["regionNames"] = REGION_NAMES
@@ -351,9 +304,9 @@ def save_training_config(output_dir, args, train_count, val_count, device):
     write_json(output_dir / "training_config.json", config)
 
 
-def save_checkpoint(checkpoint_path, model, optimizer, scheduler, args, epoch, val_metrics):
+def save_checkpoint(checkpoint_path, model, optimizer, scheduler, args, epoch, val_metrics, model_name):
     checkpoint = {
-        "modelName": "assignment_unet3d_baseline",
+        "modelName": model_name,
         "epoch": epoch,
         "modelState": model.state_dict(),
         "optimizerState": optimizer.state_dict(),
@@ -368,7 +321,3 @@ def save_checkpoint(checkpoint_path, model, optimizer, scheduler, args, epoch, v
 def write_json(file_path, content):
     with file_path.open("w", encoding="utf-8") as json_file:
         json.dump(content, json_file, ensure_ascii=False, indent=2)
-
-
-if __name__ == "__main__":
-    main()
