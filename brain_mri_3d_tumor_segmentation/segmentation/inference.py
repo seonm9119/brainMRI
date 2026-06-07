@@ -1,11 +1,12 @@
 import shutil
+from importlib import import_module
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
-from brain_mri_3d_tumor_segmentation.volume_3d.volume_service import (
+from brain_mri_3d_tumor_segmentation.volume_3d.volume import (
     find_selected_case,
     get_case_path,
     get_modality_nifti_response,
@@ -17,10 +18,12 @@ from brain_mri_3d_tumor_segmentation.volume_3d.volume_service import (
 
 SEGMENTATION_ROOT = Path(__file__).resolve().parents[1]
 SEGMENTATION_DIR = SEGMENTATION_ROOT / "segmentation"
-CHECKPOINT_DIR = SEGMENTATION_DIR / "assignment_3d_unet" / "checkpoints"
+ASSIGNMENT_CHECKPOINT_DIR = SEGMENTATION_DIR / "3d_unet" / "checkpoints"
+ENHANCED_CHECKPOINT_DIR = SEGMENTATION_DIR / "enhanced_model" / "checkpoints"
 SEGMENTATION_CACHE_DIR = SEGMENTATION_ROOT / "segmentation_cache"
 STATIC_SEGMENTATION_CACHE_PATH = "/static/segmentation-cache"
 PREDICTION_CACHE_VERSION = 1
+UNCERTAINTY_REGION_ID = "uncertainty"
 REGION_LABELS = {
     "wt": "WT",
     "tc": "TC",
@@ -32,16 +35,44 @@ MODEL_CONFIGS = {
         "id": "assignment",
         "label": "과제 제출용",
         "title": "3D U-Net Baseline",
+        "modelFactory": "brain_mri_3d_tumor_segmentation.segmentation.3d_unet.model:create_model",
         "checkpointCandidates": [
-            CHECKPOINT_DIR / "assignment_unet" / "best_metric_model.pth",
-            CHECKPOINT_DIR / "smoke_test_128_padded" / "best_metric_model.pth"
+            ASSIGNMENT_CHECKPOINT_DIR / "assignment_unet" / "best_metric_model.pth",
+            ASSIGNMENT_CHECKPOINT_DIR / "smoke_test_128_padded" / "best_metric_model.pth"
         ],
         "roiSize": (128, 128, 128),
         "swBatchSize": 2,
         "threshold": 0.5
+    },
+    "enhanced": {
+        "id": "enhanced",
+        "label": "개선 버전",
+        "title": "Confidence-aware SwinUNETR",
+        "modelFactory": "brain_mri_3d_tumor_segmentation.segmentation.enhanced_model.model:create_model",
+        "checkpointCandidates": [
+            ENHANCED_CHECKPOINT_DIR / "confidence_swin_unetr" / "best_metric_model.pth",
+            ENHANCED_CHECKPOINT_DIR / "confidence_swin_unetr" / "latest_model.pth"
+        ],
+        "roiSize": (96, 96, 96),
+        "swBatchSize": 1,
+        "threshold": 0.5,
+        "confidenceAware": True,
+        "ttaFlipDims": [
+            [],
+            [2],
+            [3],
+            [4]
+        ],
+        "uncertaintyThreshold": 0.08
     }
 }
 MODEL_CACHE = {}
+router = APIRouter(prefix="/api/brain-mri/segmentation", tags=["Segmentation Inference"])
+
+
+@router.get("/cases/{case_id}/prediction")
+def get_prediction(case_id: str, model: str = Query("assignment")):
+    return get_prediction_response(case_id, model)
 
 
 def get_prediction_response(case_id, model_id):
@@ -96,37 +127,29 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
     normalized_volume = normalize_input_volume(np.moveaxis(original_volume, -1, 0))
     input_tensor = torch.from_numpy(normalized_volume[None]).to(model["device"])
 
-    with torch.no_grad():
-        logits = sliding_window_inference(
-            inputs=input_tensor,
-            roi_size=model_config["roiSize"],
-            sw_batch_size=model_config["swBatchSize"],
-            predictor=model["network"],
-            overlap=0.5
+    if model_config.get("confidenceAware"):
+        probabilities, uncertainty_volume = run_confidence_aware_inference(
+            input_tensor,
+            model,
+            model_config,
+            torch,
+            sliding_window_inference
         )
-        probabilities = torch.sigmoid(logits)[0].detach().cpu().numpy()
+    else:
+        probability_tensor = run_probability_inference(input_tensor, model, model_config, torch, sliding_window_inference)
+        probabilities = probability_tensor[0].detach().cpu().numpy()
+        uncertainty_volume = None
 
-    threshold = model_config["threshold"]
-    tumor_core = probabilities[0] >= threshold
-    whole_tumor = probabilities[1] >= threshold
-    enhancing_tumor = probabilities[2] >= threshold
-    tumor_core = np.logical_or(tumor_core, enhancing_tumor)
-    whole_tumor = np.logical_or(whole_tumor, tumor_core)
-    combined_mask = np.zeros(whole_tumor.shape, dtype=np.uint8)
-    combined_mask[whole_tumor] = 1
-    combined_mask[tumor_core] = 2
-    combined_mask[enhancing_tumor] = 3
+    region_masks = create_region_masks(probabilities, model_config["threshold"])
+    confidence_summary = create_confidence_summary(probabilities, region_masks, uncertainty_volume, model_config)
 
     return {
         "affine": nifti_image.affine,
         "header": nifti_image.header.copy(),
         "originalShape": list(original_volume.shape),
-        "regions": {
-            "wt": whole_tumor.astype(np.uint8),
-            "tc": tumor_core.astype(np.uint8),
-            "et": enhancing_tumor.astype(np.uint8),
-            "combined": combined_mask
-        },
+        "regions": region_masks,
+        "uncertainty": uncertainty_volume,
+        "confidenceSummary": confidence_summary,
         "probabilityRange": {
             "min": float(probabilities.min()),
             "max": float(probabilities.max())
@@ -147,18 +170,139 @@ def import_inference_dependencies():
     return torch, sliding_window_inference
 
 
+def run_probability_inference(input_tensor, model, model_config, torch, sliding_window_inference):
+    use_amp = model["device"].type == "cuda"
+
+    with torch.no_grad(), torch.amp.autocast(device_type=model["device"].type, enabled=use_amp):
+        logits = sliding_window_inference(
+            inputs=input_tensor,
+            roi_size=model_config["roiSize"],
+            sw_batch_size=model_config["swBatchSize"],
+            predictor=model["network"],
+            overlap=0.5
+        )
+
+    return torch.sigmoid(logits)
+
+
+def run_confidence_aware_inference(input_tensor, model, model_config, torch, sliding_window_inference):
+    probability_tensors = []
+
+    for flip_dims in model_config["ttaFlipDims"]:
+        tta_input_tensor = input_tensor
+
+        if flip_dims:
+            tta_input_tensor = torch.flip(input_tensor, dims=flip_dims)
+
+        probability_tensor = run_probability_inference(tta_input_tensor, model, model_config, torch, sliding_window_inference)
+
+        if flip_dims:
+            probability_tensor = torch.flip(probability_tensor, dims=flip_dims)
+
+        probability_tensors.append(probability_tensor)
+
+    stacked_probabilities = torch.stack(probability_tensors, dim=0)
+    mean_probabilities = stacked_probabilities.mean(dim=0)
+    probability_std = stacked_probabilities.std(dim=0)[0]
+    probabilities = mean_probabilities[0].detach().cpu().numpy()
+    uncertainty_volume = probability_std.mean(dim=0).detach().cpu().numpy().astype(np.float32)
+
+    return probabilities, uncertainty_volume
+
+
+def create_region_masks(probabilities, threshold):
+    tumor_core = probabilities[0] >= threshold
+    whole_tumor = probabilities[1] >= threshold
+    enhancing_tumor = probabilities[2] >= threshold
+    tumor_core = np.logical_or(tumor_core, enhancing_tumor)
+    whole_tumor = np.logical_or(whole_tumor, tumor_core)
+    combined_mask = np.zeros(whole_tumor.shape, dtype=np.uint8)
+    combined_mask[whole_tumor] = 1
+    combined_mask[tumor_core] = 2
+    combined_mask[enhancing_tumor] = 3
+
+    return {
+        "wt": whole_tumor.astype(np.uint8),
+        "tc": tumor_core.astype(np.uint8),
+        "et": enhancing_tumor.astype(np.uint8),
+        "combined": combined_mask
+    }
+
+
+def create_confidence_summary(probabilities, region_masks, uncertainty_volume, model_config):
+    if uncertainty_volume is None:
+        return None
+
+    region_channels = {
+        "wt": 1,
+        "tc": 0,
+        "et": 2
+    }
+    region_confidence = {}
+
+    for region_id, channel_index in region_channels.items():
+        region_mask = region_masks[region_id].astype(bool)
+        region_confidence[region_id] = calculate_region_confidence(
+            probabilities[channel_index],
+            uncertainty_volume,
+            region_mask
+        )
+
+    tumor_mask = region_masks["combined"] > 0
+    uncertainty_threshold = model_config["uncertaintyThreshold"]
+    uncertain_voxel_ratio = calculate_uncertain_voxel_ratio(uncertainty_volume, tumor_mask, uncertainty_threshold)
+    review_recommended = uncertain_voxel_ratio >= 0.08 or region_confidence["et"]["confidence"] < 0.65
+
+    return {
+        "method": "flip TTA mean probability with prediction disagreement uncertainty",
+        "ttaCount": len(model_config["ttaFlipDims"]),
+        "uncertaintyThreshold": uncertainty_threshold,
+        "uncertainVoxelRatio": uncertain_voxel_ratio,
+        "reviewRecommended": review_recommended,
+        "regions": region_confidence
+    }
+
+
+def calculate_region_confidence(region_probability, uncertainty_volume, region_mask):
+    if not region_mask.any():
+        return {
+            "confidence": 0.0,
+            "meanProbability": 0.0,
+            "meanUncertainty": 0.0,
+            "voxelCount": 0
+        }
+
+    mean_probability = float(region_probability[region_mask].mean())
+    mean_uncertainty = float(uncertainty_volume[region_mask].mean())
+    confidence = mean_probability * (1 - min(mean_uncertainty * 2, 1))
+
+    return {
+        "confidence": float(np.clip(confidence, 0, 1)),
+        "meanProbability": mean_probability,
+        "meanUncertainty": mean_uncertainty,
+        "voxelCount": int(region_mask.sum())
+    }
+
+
+def calculate_uncertain_voxel_ratio(uncertainty_volume, tumor_mask, uncertainty_threshold):
+    if not tumor_mask.any():
+        return 0.0
+
+    uncertain_voxels = np.logical_and(tumor_mask, uncertainty_volume >= uncertainty_threshold)
+
+    return float(uncertain_voxels.sum() / tumor_mask.sum())
+
+
 def load_model(model_config, checkpoint_info, torch):
     cache_key = f"{model_config['id']}:{checkpoint_info['path']}:{checkpoint_info['mtime']}"
 
     if cache_key in MODEL_CACHE:
         return MODEL_CACHE[cache_key]
 
-    from brain_mri_3d_tumor_segmentation.segmentation.assignment_3d_unet.train_baseline import create_model
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_info["path"], map_location=device, weights_only=False)
     model_state = checkpoint.get("modelState") or checkpoint
-    network = create_model().to(device)
+    network = load_model_factory(model_config["modelFactory"])().to(device)
     network.load_state_dict(model_state)
     network.eval()
     MODEL_CACHE.clear()
@@ -168,6 +312,13 @@ def load_model(model_config, checkpoint_info, torch):
     }
 
     return MODEL_CACHE[cache_key]
+
+
+def load_model_factory(model_factory_path):
+    module_path, function_name = model_factory_path.split(":")
+    model_module = import_module(module_path)
+
+    return getattr(model_module, function_name)
 
 
 def normalize_input_volume(channel_first_volume):
@@ -208,6 +359,7 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
             "voxelCount": region_counts[region_id]
         }
 
+    uncertainty_info = save_uncertainty_cache(cache_dir, selected_case, model_config, prediction_data)
     prediction_manifest = {
         "version": PREDICTION_CACHE_VERSION,
         "caseId": selected_case["caseId"],
@@ -221,12 +373,38 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
         "threshold": model_config["threshold"],
         "regions": overlays,
         "regionCounts": region_counts,
+        "confidenceSummary": prediction_data["confidenceSummary"],
+        "uncertainty": uncertainty_info,
         "probabilityRange": prediction_data["probabilityRange"],
         "baseNifti": get_modality_nifti_response(selected_case["caseId"], "flair")
     }
     write_json(cache_dir / "manifest.json", prediction_manifest)
 
     return prediction_manifest
+
+
+def save_uncertainty_cache(cache_dir, selected_case, model_config, prediction_data):
+    uncertainty_volume = prediction_data.get("uncertainty")
+
+    if uncertainty_volume is None:
+        return None
+
+    uncertainty_path = cache_dir / f"{UNCERTAINTY_REGION_ID}.nii.gz"
+    save_float_nifti(
+        uncertainty_path,
+        uncertainty_volume,
+        prediction_data["affine"],
+        prediction_data["header"]
+    )
+
+    return {
+        "id": UNCERTAINTY_REGION_ID,
+        "label": "TTA uncertainty",
+        "niftiUrl": get_prediction_nifti_url(model_config["id"], selected_case["caseId"], UNCERTAINTY_REGION_ID),
+        "min": float(uncertainty_volume.min()),
+        "max": float(uncertainty_volume.max()),
+        "mean": float(uncertainty_volume.mean())
+    }
 
 
 def save_region_nifti(region_path, region_volume, affine, header):
@@ -239,6 +417,15 @@ def save_region_nifti(region_path, region_volume, affine, header):
     region_header["scl_slope"] = 1
     region_header["scl_inter"] = 0
     nib.save(nib.Nifti1Image(region_volume.astype(np.uint8), affine, region_header), str(region_path))
+
+
+def save_float_nifti(file_path, volume, affine, header):
+    float_header = header.copy()
+    float_header.set_data_shape(volume.shape)
+    float_header.set_data_dtype(np.float32)
+    float_header["cal_min"] = float(volume.min())
+    float_header["cal_max"] = float(volume.max())
+    nib.save(nib.Nifti1Image(volume.astype(np.float32), affine, float_header), str(file_path))
 
 
 def is_prediction_manifest_ready(manifest_path, checkpoint_info):
@@ -262,6 +449,18 @@ def is_prediction_manifest_ready(manifest_path, checkpoint_info):
         region_path = SEGMENTATION_CACHE_DIR / region_info["niftiUrl"].removeprefix(f"{STATIC_SEGMENTATION_CACHE_PATH}/")
 
         if not region_path.exists():
+            return False
+
+    if manifest.get("modelId") == "enhanced":
+        uncertainty_info = manifest.get("uncertainty")
+        confidence_summary = manifest.get("confidenceSummary")
+
+        if not uncertainty_info or not confidence_summary:
+            return False
+
+        uncertainty_path = SEGMENTATION_CACHE_DIR / uncertainty_info["niftiUrl"].removeprefix(f"{STATIC_SEGMENTATION_CACHE_PATH}/")
+
+        if not uncertainty_path.exists():
             return False
 
     return True

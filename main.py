@@ -2,10 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from brain_mri_3d_tumor_segmentation.segmentation.inference_router import router as inference_router
-from brain_mri_3d_tumor_segmentation.segmentation.inference_service import SEGMENTATION_CACHE_DIR
-from brain_mri_3d_tumor_segmentation.volume_3d.volume_router import router as volume_router
-from brain_mri_3d_tumor_segmentation.volume_3d.volume_service import NIFTI_CACHE_DIR
+from brain_mri_3d_tumor_segmentation.segmentation.inference import (
+    SEGMENTATION_CACHE_DIR,
+    router as inference_router
+)
+from brain_mri_3d_tumor_segmentation.volume_3d.volume import (
+    NIFTI_CACHE_DIR,
+    router as volume_router
+)
 
 
 NIFTI_CACHE_DIR.mkdir(parents=True, exist_ok=True)

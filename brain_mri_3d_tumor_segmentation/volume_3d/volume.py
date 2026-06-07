@@ -3,7 +3,7 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 
 SEGMENTATION_ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +12,17 @@ SELECTED_CASES_PATH = SAMPLE_DIR / "selected_cases.json"
 NIFTI_CACHE_DIR = SEGMENTATION_ROOT / "nifti_cache"
 STATIC_NIFTI_CACHE_PATH = "/static/nifti-cache"
 INPUT_VOLUME_FIT_RENDER_SCALE = 0.72
+router = APIRouter(prefix="/api/brain-mri/segmentation", tags=["3D MRI Volume"])
+
+
+@router.get("/cases")
+def list_cases():
+    return get_selected_cases_response()
+
+
+@router.get("/cases/{case_id}/modality-nifti")
+def get_modality_nifti(case_id: str, modality: str = Query("flair")):
+    return get_modality_nifti_response(case_id, modality)
 
 
 def get_selected_cases_response():
