@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--train-case-limit", type=int)
     parser.add_argument("--val-case-limit", type=int)
     parser.add_argument("--val-interval", type=int, default=1)
-    parser.add_argument("--val-loss-patience", type=int, default=12)
+    parser.add_argument("--val-loss-patience", type=int, default=5)
     parser.add_argument("--metric-patience", type=int, default=20)
     parser.add_argument("--val-loss-min-delta", type=float, default=1e-4)
     parser.add_argument("--metric-min-delta", type=float, default=1e-4)

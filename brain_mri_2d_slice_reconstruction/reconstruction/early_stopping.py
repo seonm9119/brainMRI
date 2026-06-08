@@ -1,7 +1,7 @@
 class EarlyStoppingMonitor:
     def __init__(
         self,
-        val_loss_patience=12,
+        val_loss_patience=5,
         metric_patience=20,
         val_loss_min_delta=1e-4,
         metric_min_delta=1e-4,
