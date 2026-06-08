@@ -10,7 +10,7 @@ services:
     user: "${BRAINMRI_UID:-1000}:${BRAINMRI_GID:-1000}"
     restart: unless-stopped
     ports:
-      - "8010:8010"
+      - "127.0.0.1:8010:8010"
     environment:
       - USER=nami
       - LOGNAME=nami
