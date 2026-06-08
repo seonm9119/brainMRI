@@ -2,12 +2,20 @@ services:
   brainmri:
     build:
       context: .
-    container_name: brainMRI
+    image: brain-mri:latest
+    container_name: brain-mri
+    networks:
+      - default
+      - awesome_default
     user: "${BRAINMRI_UID:-1000}:${BRAINMRI_GID:-1000}"
     restart: unless-stopped
     ports:
-      - "8010:8010"
+      - "127.0.0.1:8010:8010"
     environment:
+      - USER=nami
+      - LOGNAME=nami
+      - HOME=/tmp
+      - TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
       - BRAINMRI_GPT_INTERPRETATION_API_URL=${BRAINMRI_GPT_INTERPRETATION_API_URL:-http://192.168.0.21:8003/brain-mri/segmentation/interpret}
       - BRAINMRI_GPT_INTERPRETATION_TIMEOUT=${BRAINMRI_GPT_INTERPRETATION_TIMEOUT:-120}
     volumes:
@@ -16,3 +24,13 @@ services:
       - ./brain_mri_3d_tumor_segmentation/segmentation/enhanced_model/checkpoints:/app/brain_mri_3d_tumor_segmentation/segmentation/enhanced_model/checkpoints:ro
       - ./brain_mri_3d_tumor_segmentation/nifti_cache:/app/brain_mri_3d_tumor_segmentation/nifti_cache
       - ./brain_mri_3d_tumor_segmentation/segmentation_cache:/app/brain_mri_3d_tumor_segmentation/segmentation_cache
+      - ./brain_mri_2d_slice_reconstruction/brain_2d:/app/brain_mri_2d_slice_reconstruction/brain_2d:ro
+      - ./brain_mri_2d_slice_reconstruction/reconstruction/plain_unet/checkpoints:/app/brain_mri_2d_slice_reconstruction/reconstruction/plain_unet/checkpoints:ro
+      - ./brain_mri_2d_slice_reconstruction/reconstruction/mamba_conv_unet/checkpoints:/app/brain_mri_2d_slice_reconstruction/reconstruction/mamba_conv_unet/checkpoints:ro
+      - ./brain_mri_2d_slice_reconstruction/reconstruction/plain_gan/checkpoints:/app/brain_mri_2d_slice_reconstruction/reconstruction/plain_gan/checkpoints:ro
+      - ./brain_mri_2d_slice_reconstruction/reconstruction/resvit_gan/checkpoints:/app/brain_mri_2d_slice_reconstruction/reconstruction/resvit_gan/checkpoints:ro
+      - ./brain_mri_2d_slice_reconstruction/reconstruction_cache:/app/brain_mri_2d_slice_reconstruction/reconstruction_cache
+
+networks:
+  awesome_default:
+    external: true
