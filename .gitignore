@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-.venv-training/
 venv/
 
 # Jupyter
@@ -13,13 +12,13 @@ venv/
 .vscode/
 
 # Data
+sample/
 data/
 datasets/
 DecathlonDataset/
 gan_dataset/
 brain_mri_3d_tumor_segmentation/decathlon/
-brain_mri_3d_tumor_segmentation/sample/*
-!brain_mri_3d_tumor_segmentation/sample/selected_cases.json
+brain_mri_3d_tumor_segmentation/sample/
 brain_mri_3d_tumor_segmentation/nifti_cache/
 brain_mri_3d_tumor_segmentation/segmentation_cache/
 brain_mri_2d_slice_reconstruction/brain_2d/
