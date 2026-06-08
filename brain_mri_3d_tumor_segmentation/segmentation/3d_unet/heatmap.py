@@ -12,6 +12,8 @@ from brain_mri_3d_tumor_segmentation.segmentation.data import load_decathlon_cas
 from .score import (
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_CONFIG_PATH,
+    DEFAULT_MODEL_FACTORY,
+    DEFAULT_MODEL_TITLE,
     REGION_IDS,
     REGION_NAME_BY_ID,
     create_prediction_regions,
@@ -28,7 +30,7 @@ from .score import (
 SEGMENTATION_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = SEGMENTATION_ROOT / "decathlon"
 DEFAULT_OUTPUT_DIR = SEGMENTATION_ROOT / "segmentation_cache" / "assignment" / "heatmap"
-STATIC_HEATMAP_PATH = "/static/segmentation-cache/assignment/heatmap"
+STATIC_SEGMENTATION_CACHE_PATH = "/static/segmentation-cache"
 REGION_COLORS = {
     "wt": (37, 151, 150),
     "tc": (225, 83, 132),
@@ -46,7 +48,11 @@ def parse_args():
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument("--split-config", help="Training config used only for validation split selection.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--model-id", default="assignment")
+    parser.add_argument("--model-factory", default=DEFAULT_MODEL_FACTORY)
+    parser.add_argument("--model-title", default=DEFAULT_MODEL_TITLE)
     parser.add_argument("--case-id", help="BRATS case id. Defaults to the first validation case from the trained split.")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -64,10 +70,12 @@ def main():
     config_path = Path(command_args.config)
     output_dir = Path(command_args.output_dir)
     training_config = load_training_config(config_path)
-    train_cases, validation_cases = load_train_validation_cases(data_dir, training_config)
+    split_config_path = Path(command_args.split_config) if command_args.split_config else config_path
+    split_config = load_training_config(split_config_path)
+    train_cases, validation_cases = load_train_validation_cases(data_dir, split_config)
     selected_case = select_heatmap_case(train_cases, validation_cases, command_args.case_id)
     device = resolve_device(command_args.device)
-    model = load_checkpoint_model(checkpoint_path, device)
+    model = load_checkpoint_model(checkpoint_path, device, command_args.model_factory)
     score_transform = create_score_transform(training_config)
     heatmap_data = run_heatmap_inference(
         selected_case,
@@ -91,6 +99,9 @@ def main():
     )
     heatmap_manifest = save_heatmap_outputs(
         output_dir,
+        command_args.model_id,
+        command_args.model_title,
+        split_config_path,
         selected_case,
         heatmap_data,
         int(command_args.axis),
@@ -260,7 +271,17 @@ def calculate_case_uncertainty_summary(heatmap_data):
     }
 
 
-def save_heatmap_outputs(output_dir, selected_case, heatmap_data, axis, panel_size, validation_summary):
+def save_heatmap_outputs(
+    output_dir,
+    model_id,
+    model_title,
+    split_config_path,
+    selected_case,
+    heatmap_data,
+    axis,
+    panel_size,
+    validation_summary
+):
     case_output_dir = output_dir / selected_case["caseId"]
     case_output_dir.mkdir(parents=True, exist_ok=True)
     slice_index = select_representative_slice(
@@ -292,7 +313,16 @@ def save_heatmap_outputs(output_dir, selected_case, heatmap_data, axis, panel_si
     uncertainty_panel.save(case_output_dir / "uncertainty_heatmap.png")
     triptych.save(case_output_dir / "heatmap_triptych.png")
 
-    heatmap_manifest = create_heatmap_manifest(selected_case, heatmap_data, axis, slice_index, validation_summary)
+    heatmap_manifest = create_heatmap_manifest(
+        model_id,
+        model_title,
+        split_config_path,
+        selected_case,
+        heatmap_data,
+        axis,
+        slice_index,
+        validation_summary
+    )
     write_json(case_output_dir / "manifest.json", heatmap_manifest)
     write_json(output_dir / "manifest.json", heatmap_manifest)
 
@@ -556,14 +586,17 @@ def get_heatmap_color(uncertainty_value):
     return tuple(int(channel) for channel in color)
 
 
-def create_heatmap_manifest(selected_case, heatmap_data, axis, slice_index, validation_summary):
+def create_heatmap_manifest(model_id, model_title, split_config_path, selected_case, heatmap_data, axis, slice_index, validation_summary):
     representative_uncertainty = calculate_case_uncertainty_summary(heatmap_data)
-    case_static_path = f"{STATIC_HEATMAP_PATH}/{selected_case['caseId']}"
+    case_static_path = f"{STATIC_SEGMENTATION_CACHE_PATH}/{model_id}/heatmap/{selected_case['caseId']}"
 
     return {
+        "modelId": model_id,
+        "model": model_title,
         "caseId": selected_case["caseId"],
         "fileName": selected_case["imagePath"].name,
         "split": "validation",
+        "splitConfig": str(split_config_path),
         "axis": axis,
         "sliceIndex": slice_index,
         "method": "max region uncertainty from 4 * p * (1 - p)",

@@ -9,6 +9,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
+from PIL import Image, ImageDraw
 
 from brain_mri_3d_tumor_segmentation.volume_3d.volume import (
     find_selected_case,
@@ -27,12 +28,13 @@ ENHANCED_CHECKPOINT_DIR = SEGMENTATION_DIR / "enhanced_model" / "checkpoints"
 SEGMENTATION_CACHE_DIR = SEGMENTATION_ROOT / "segmentation_cache"
 STATIC_SEGMENTATION_CACHE_PATH = "/static/segmentation-cache"
 UNCERTAINTY_REGION_ID = "uncertainty"
+COMPARISON_SLICE_CACHE_VERSION = "full-brain-axis-v4"
 GPT_INTERPRETATION_API_URL = os.environ.get(
     "BRAINMRI_GPT_INTERPRETATION_API_URL",
     "http://192.168.0.21:8003/brain-mri/segmentation/interpret"
 ).strip()
 GPT_INTERPRETATION_TIMEOUT = float(os.environ.get("BRAINMRI_GPT_INTERPRETATION_TIMEOUT", "120"))
-GPT_INTERPRETATION_MODEL_IDS = {"assignment"}
+GPT_INTERPRETATION_MODEL_IDS = {"assignment", "enhanced"}
 REGION_LABELS = {
     "wt": "WT",
     "tc": "TC",
@@ -84,12 +86,103 @@ def get_prediction(case_id: str, model: str = Query("assignment")):
     return get_prediction_response(case_id, model)
 
 
+@router.get("/cases/{case_id}/prediction-difference")
+def get_prediction_difference(
+    case_id: str,
+    model: str = Query("enhanced"),
+    baseline: str = Query("assignment"),
+    region: str = Query("tc")
+):
+    return get_prediction_difference_response(case_id, model, baseline, region)
+
+
+@router.get("/cases/{case_id}/prediction-comparison-slice")
+def get_prediction_comparison_slice(
+    case_id: str,
+    model: str = Query("enhanced"),
+    baseline: str = Query("assignment"),
+    region: str = Query("tc")
+):
+    return get_prediction_comparison_slice_response(case_id, model, baseline, region)
+
+
 def get_prediction_response(case_id, model_id):
     selected_case, model_config = get_selected_case_and_model(case_id, model_id)
     prediction_manifest = ensure_prediction_cache(selected_case, model_config)
     prediction_manifest["cacheHit"] = prediction_manifest.get("cacheHit", False)
 
     return prediction_manifest
+
+
+def get_prediction_difference_response(case_id, model_id, baseline_model_id, region_id):
+    selected_case, model_config = get_selected_case_and_model(case_id, model_id)
+    _, baseline_model_config = get_selected_case_and_model(case_id, baseline_model_id)
+    normalized_region_id = normalize_difference_region_id(region_id)
+    model_prediction_manifest = ensure_prediction_cache(selected_case, model_config)
+    baseline_prediction_manifest = ensure_prediction_cache(selected_case, baseline_model_config)
+    model_checkpoint = model_prediction_manifest["checkpoint"]
+    baseline_checkpoint = baseline_prediction_manifest["checkpoint"]
+    cache_dir = get_difference_cache_dir(model_config["id"], selected_case["caseId"])
+    manifest_path = cache_dir / f"{baseline_model_config['id']}_vs_{model_config['id']}_{normalized_region_id}.json"
+
+    if is_difference_manifest_ready(manifest_path, model_checkpoint, baseline_checkpoint):
+        difference_manifest = read_json(manifest_path)
+        difference_manifest["cacheHit"] = True
+        return difference_manifest
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    difference_manifest = save_prediction_difference_cache(
+        cache_dir,
+        selected_case,
+        model_config,
+        baseline_model_config,
+        normalized_region_id,
+        model_prediction_manifest,
+        baseline_prediction_manifest
+    )
+    difference_manifest["cacheHit"] = False
+
+    return difference_manifest
+
+
+def get_prediction_comparison_slice_response(case_id, model_id, baseline_model_id, region_id):
+    selected_case, model_config = get_selected_case_and_model(case_id, model_id)
+    _, baseline_model_config = get_selected_case_and_model(case_id, baseline_model_id)
+    normalized_region_id = normalize_difference_region_id(region_id)
+    model_prediction_manifest = ensure_prediction_cache(selected_case, model_config)
+    baseline_prediction_manifest = ensure_prediction_cache(selected_case, baseline_model_config)
+    difference_manifest = get_prediction_difference_response(
+        case_id,
+        model_config["id"],
+        baseline_model_config["id"],
+        normalized_region_id
+    )
+    cache_dir = get_comparison_slice_cache_dir(model_config["id"], selected_case["caseId"])
+    manifest_path = cache_dir / f"{baseline_model_config['id']}_vs_{model_config['id']}_{normalized_region_id}_slice.json"
+
+    if is_comparison_slice_manifest_ready(
+        manifest_path,
+        model_prediction_manifest["checkpoint"],
+        baseline_prediction_manifest["checkpoint"]
+    ):
+        comparison_manifest = read_json(manifest_path)
+        comparison_manifest["cacheHit"] = True
+        return comparison_manifest
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    comparison_manifest = save_prediction_comparison_slice_cache(
+        cache_dir,
+        selected_case,
+        model_config,
+        baseline_model_config,
+        normalized_region_id,
+        model_prediction_manifest,
+        baseline_prediction_manifest,
+        difference_manifest
+    )
+    comparison_manifest["cacheHit"] = False
+
+    return comparison_manifest
 
 
 def get_selected_case_and_model(case_id, model_id):
@@ -133,7 +226,12 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
     if original_volume.ndim != 4 or original_volume.shape[-1] != 4:
         raise HTTPException(status_code=422, detail="4-channel BRATS NIfTI volume만 inference할 수 있습니다.")
 
-    normalized_volume = normalize_input_volume(np.moveaxis(original_volume, -1, 0))
+    spatial_shape = original_volume.shape[:3]
+    channel_first_volume = np.moveaxis(original_volume, -1, 0)
+    crop_slices = get_foreground_crop_slices(original_volume, model_config["roiSize"])
+    cropped_volume = channel_first_volume[(slice(None),) + crop_slices]
+    crop_metadata = create_crop_metadata(crop_slices, spatial_shape, cropped_volume.shape[1:])
+    normalized_volume = normalize_input_volume(cropped_volume)
     input_tensor = torch.from_numpy(normalized_volume[None]).to(model["device"])
 
     if model_config.get("confidenceAware"):
@@ -149,6 +247,11 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
         probabilities = probability_tensor[0].detach().cpu().numpy()
         uncertainty_volume = None
 
+    probabilities = restore_probability_volume(probabilities, spatial_shape, crop_slices)
+
+    if uncertainty_volume is not None:
+        uncertainty_volume = restore_scalar_volume(uncertainty_volume, spatial_shape, crop_slices)
+
     region_masks = create_region_masks(probabilities, model_config["threshold"])
     confidence_summary = create_confidence_summary(probabilities, region_masks, uncertainty_volume, model_config)
     quantitative_summary = create_quantitative_summary(original_volume, probabilities, region_masks, uncertainty_volume, nifti_image)
@@ -158,6 +261,7 @@ def run_model_inference(selected_case, model_config, checkpoint_info):
         "affine": nifti_image.affine,
         "header": nifti_image.header.copy(),
         "originalShape": list(original_volume.shape),
+        "inferenceCrop": crop_metadata,
         "regions": region_masks,
         "uncertainty": uncertainty_volume,
         "confidenceSummary": confidence_summary,
@@ -216,11 +320,69 @@ def run_confidence_aware_inference(input_tensor, model, model_config, torch, sli
 
     stacked_probabilities = torch.stack(probability_tensors, dim=0)
     mean_probabilities = stacked_probabilities.mean(dim=0)
-    probability_std = stacked_probabilities.std(dim=0)[0]
+    probability_std = stacked_probabilities.std(dim=0, unbiased=False)[0]
     probabilities = mean_probabilities[0].detach().cpu().numpy()
     uncertainty_volume = probability_std.mean(dim=0).detach().cpu().numpy().astype(np.float32)
 
     return probabilities, uncertainty_volume
+
+
+def get_foreground_crop_slices(original_volume, roi_size, margin=8):
+    foreground_mask = create_brain_foreground_mask(original_volume)
+    spatial_shape = original_volume.shape[:3]
+
+    if not foreground_mask.any():
+        return tuple(slice(0, axis_size) for axis_size in spatial_shape)
+
+    foreground_indices = np.where(foreground_mask)
+    crop_slices = []
+
+    for axis, axis_size in enumerate(spatial_shape):
+        axis_start = max(int(foreground_indices[axis].min()) - margin, 0)
+        axis_end = min(int(foreground_indices[axis].max()) + margin + 1, axis_size)
+        minimum_size = min(int(roi_size[axis]), axis_size)
+        current_size = axis_end - axis_start
+
+        if current_size < minimum_size:
+            missing_size = minimum_size - current_size
+            left_padding = missing_size // 2
+            right_padding = missing_size - left_padding
+            axis_start = max(axis_start - left_padding, 0)
+            axis_end = min(axis_end + right_padding, axis_size)
+
+            if axis_end - axis_start < minimum_size:
+                axis_start = max(axis_end - minimum_size, 0)
+                axis_end = min(axis_start + minimum_size, axis_size)
+
+        crop_slices.append(slice(axis_start, axis_end))
+
+    return tuple(crop_slices)
+
+
+def create_crop_metadata(crop_slices, spatial_shape, cropped_shape):
+    return {
+        "start": [int(crop_slice.start or 0) for crop_slice in crop_slices],
+        "end": [int(crop_slice.stop) for crop_slice in crop_slices],
+        "originalSpatialShape": [int(axis_size) for axis_size in spatial_shape],
+        "croppedSpatialShape": [int(axis_size) for axis_size in cropped_shape]
+    }
+
+
+def restore_probability_volume(cropped_probabilities, spatial_shape, crop_slices):
+    restored_probabilities = np.zeros(
+        (cropped_probabilities.shape[0],) + tuple(spatial_shape),
+        dtype=cropped_probabilities.dtype
+    )
+    restored_probabilities[(slice(None),) + crop_slices] = cropped_probabilities
+
+    return restored_probabilities
+
+
+def restore_scalar_volume(cropped_volume, spatial_shape, crop_slices):
+    restored_volume = np.zeros(tuple(spatial_shape), dtype=cropped_volume.dtype)
+    restored_volume[crop_slices] = cropped_volume
+
+    return restored_volume
 
 
 def create_region_masks(probabilities, threshold):
@@ -531,12 +693,14 @@ def load_heatmap_context(model_id):
         return {}
 
     heatmap_manifest = read_json(heatmap_path)
+    validation_summary = heatmap_manifest.get("validationSummary") or {}
 
     return {
         "caseId": heatmap_manifest.get("caseId"),
-        "meanUncertainty": heatmap_manifest.get("meanUncertainty"),
-        "maxUncertainty": heatmap_manifest.get("maxUncertainty"),
-        "uncertainVoxelRatio": heatmap_manifest.get("uncertainVoxelRatio")
+        "meanUncertainty": validation_summary.get("meanUncertainty", heatmap_manifest.get("meanUncertainty")),
+        "maxUncertainty": validation_summary.get("maxUncertainty", heatmap_manifest.get("maxUncertainty")),
+        "uncertainVoxelRatio": validation_summary.get("uncertainVoxelRatio", heatmap_manifest.get("uncertainVoxelRatio")),
+        "caseCount": validation_summary.get("caseCount")
     }
 
 
@@ -616,6 +780,7 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
         "checkpoint": checkpoint_info,
         "inputShape": prediction_data["originalShape"],
         "outputShape": list(prediction_data["regions"]["combined"].shape),
+        "inferenceCrop": prediction_data["inferenceCrop"],
         "threshold": model_config["threshold"],
         "regions": overlays,
         "regionCounts": region_counts,
@@ -652,6 +817,446 @@ def save_uncertainty_cache(cache_dir, selected_case, model_config, prediction_da
         "min": float(uncertainty_volume.min()),
         "max": float(uncertainty_volume.max()),
         "mean": float(uncertainty_volume.mean())
+    }
+
+
+def save_prediction_difference_cache(
+    cache_dir,
+    selected_case,
+    model_config,
+    baseline_model_config,
+    region_id,
+    model_prediction_manifest,
+    baseline_prediction_manifest
+):
+    model_region_info = model_prediction_manifest["regions"][region_id]
+    baseline_region_info = baseline_prediction_manifest["regions"][region_id]
+    model_region_path = get_static_cache_file_path(model_region_info["niftiUrl"])
+    baseline_region_path = get_static_cache_file_path(baseline_region_info["niftiUrl"])
+    model_region_image = nib.load(str(model_region_path))
+    baseline_region_image = nib.load(str(baseline_region_path))
+    model_region_mask = np.asarray(model_region_image.dataobj) > 0
+    baseline_region_mask = np.asarray(baseline_region_image.dataobj) > 0
+    baseline_only_mask = np.logical_and(baseline_region_mask, ~model_region_mask)
+    model_only_mask = np.logical_and(model_region_mask, ~baseline_region_mask)
+    difference_volume = np.zeros(model_region_mask.shape, dtype=np.uint8)
+    difference_volume[baseline_only_mask] = 1
+    difference_volume[model_only_mask] = 2
+    difference_filename = f"{baseline_model_config['id']}_vs_{model_config['id']}_{region_id}.nii.gz"
+    difference_path = cache_dir / difference_filename
+    save_region_nifti(difference_path, difference_volume, model_region_image.affine, model_region_image.header.copy())
+    baseline_voxel_count = int(baseline_region_mask.sum())
+    model_voxel_count = int(model_region_mask.sum())
+    baseline_only_voxel_count = int(baseline_only_mask.sum())
+    model_only_voxel_count = int(model_only_mask.sum())
+    disagreement_voxel_count = baseline_only_voxel_count + model_only_voxel_count
+    union_voxel_count = int(np.logical_or(baseline_region_mask, model_region_mask).sum())
+    manifest = {
+        "caseId": selected_case["caseId"],
+        "fileName": selected_case["fileName"],
+        "region": region_id,
+        "regionLabel": REGION_LABELS[region_id],
+        "modelId": model_config["id"],
+        "modelTitle": model_config["title"],
+        "baselineModelId": baseline_model_config["id"],
+        "baselineModelTitle": baseline_model_config["title"],
+        "modelCheckpoint": model_prediction_manifest["checkpoint"],
+        "baselineCheckpoint": baseline_prediction_manifest["checkpoint"],
+        "niftiUrl": get_difference_nifti_url(model_config["id"], selected_case["caseId"], difference_filename),
+        "labels": {
+            "1": "3D U-Net only",
+            "2": "SwinUNETR only"
+        },
+        "counts": {
+            "baselineVoxels": baseline_voxel_count,
+            "modelVoxels": model_voxel_count,
+            "baselineOnlyVoxels": baseline_only_voxel_count,
+            "modelOnlyVoxels": model_only_voxel_count,
+            "disagreementVoxels": disagreement_voxel_count,
+            "unionVoxels": union_voxel_count
+        },
+        "ratios": {
+            "baselineOnlyUnionRatio": safe_ratio(baseline_only_voxel_count, union_voxel_count),
+            "modelOnlyUnionRatio": safe_ratio(model_only_voxel_count, union_voxel_count),
+            "disagreementUnionRatio": safe_ratio(disagreement_voxel_count, union_voxel_count)
+        }
+    }
+    manifest_path = cache_dir / f"{baseline_model_config['id']}_vs_{model_config['id']}_{region_id}.json"
+    write_json(manifest_path, manifest)
+
+    return manifest
+
+
+def save_prediction_comparison_slice_cache(
+    cache_dir,
+    selected_case,
+    model_config,
+    baseline_model_config,
+    region_id,
+    model_prediction_manifest,
+    baseline_prediction_manifest,
+    difference_manifest
+):
+    case_path = get_case_path(selected_case)
+    case_image = nib.load(str(case_path))
+    original_volume = np.asarray(case_image.dataobj, dtype=np.float32)
+    flair_volume = original_volume[:, :, :, 0]
+    model_mask = load_prediction_mask(model_prediction_manifest["regions"][region_id]["niftiUrl"])
+    baseline_mask = load_prediction_mask(baseline_prediction_manifest["regions"][region_id]["niftiUrl"])
+    baseline_only_mask = np.logical_and(baseline_mask, ~model_mask)
+    model_only_mask = np.logical_and(model_mask, ~baseline_mask)
+    axis, slice_index = select_comparison_slice(
+        flair_volume,
+        baseline_mask,
+        model_mask,
+        baseline_only_mask,
+        model_only_mask
+    )
+    image_slice = extract_display_slice(flair_volume, axis, slice_index)
+    baseline_slice = extract_display_slice(baseline_mask.astype(np.uint8), axis, slice_index)
+    model_slice = extract_display_slice(model_mask.astype(np.uint8), axis, slice_index)
+    baseline_only_slice = extract_display_slice(baseline_only_mask.astype(np.uint8), axis, slice_index)
+    model_only_slice = extract_display_slice(model_only_mask.astype(np.uint8), axis, slice_index)
+    crop_box = get_comparison_crop_box(image_slice, baseline_slice, model_slice, baseline_only_slice, model_only_slice)
+    image_slice = crop_slice(image_slice, crop_box)
+    baseline_slice = crop_slice(baseline_slice, crop_box)
+    model_slice = crop_slice(model_slice, crop_box)
+    baseline_only_slice = crop_slice(baseline_only_slice, crop_box)
+    model_only_slice = crop_slice(model_only_slice, crop_box)
+    panel_size = 230
+    baseline_color = get_region_rgb_color(region_id)
+    model_color = get_region_rgb_color(region_id)
+    comparison_image = create_model_comparison_slice_image([
+        ("MRI", create_mri_slice_panel(image_slice, panel_size)),
+        ("3D U-Net", create_mask_overlay_panel(image_slice, baseline_slice, baseline_color, panel_size)),
+        ("SwinUNETR", create_mask_overlay_panel(image_slice, model_slice, model_color, panel_size)),
+        ("Difference", create_difference_overlay_panel(image_slice, baseline_only_slice, model_only_slice, panel_size))
+    ])
+    image_filename = (
+        f"{baseline_model_config['id']}_vs_{model_config['id']}_{region_id}_"
+        f"{COMPARISON_SLICE_CACHE_VERSION}_slice.png"
+    )
+    image_path = cache_dir / image_filename
+    comparison_image.save(image_path)
+    comparison_manifest = {
+        "cacheVersion": COMPARISON_SLICE_CACHE_VERSION,
+        "caseId": selected_case["caseId"],
+        "fileName": selected_case["fileName"],
+        "region": region_id,
+        "regionLabel": REGION_LABELS[region_id],
+        "axis": axis,
+        "sliceIndex": slice_index,
+        "imageUrl": get_comparison_slice_image_url(model_config["id"], selected_case["caseId"], image_filename),
+        "modelId": model_config["id"],
+        "modelTitle": model_config["title"],
+        "baselineModelId": baseline_model_config["id"],
+        "baselineModelTitle": baseline_model_config["title"],
+        "modelCheckpoint": model_prediction_manifest["checkpoint"],
+        "baselineCheckpoint": baseline_prediction_manifest["checkpoint"],
+        "difference": {
+            "niftiUrl": difference_manifest["niftiUrl"],
+            "counts": difference_manifest["counts"],
+            "ratios": difference_manifest["ratios"],
+            "labels": difference_manifest["labels"]
+        },
+        "interpretation": create_comparison_slice_interpretation(region_id, difference_manifest)
+    }
+    manifest_path = cache_dir / f"{baseline_model_config['id']}_vs_{model_config['id']}_{region_id}_slice.json"
+    write_json(manifest_path, comparison_manifest)
+
+    return comparison_manifest
+
+
+def load_prediction_mask(nifti_url):
+    return np.asarray(nib.load(str(get_static_cache_file_path(nifti_url))).dataobj) > 0
+
+
+def select_comparison_slice(image_volume, baseline_mask, model_mask, baseline_only_mask, model_only_mask):
+    disagreement_mask = np.logical_or(baseline_only_mask, model_only_mask)
+    union_mask = np.logical_or(baseline_mask, model_mask)
+    best_candidate = None
+
+    for axis in range(3):
+        foreground_counts = []
+        slice_scores = []
+
+        for slice_index in range(image_volume.shape[axis]):
+            disagreement_slice = extract_raw_slice(disagreement_mask, axis, slice_index)
+            union_slice = extract_raw_slice(union_mask, axis, slice_index)
+            image_slice = extract_raw_slice(image_volume, axis, slice_index)
+            image_foreground = np.abs(image_slice) > 1e-6
+            foreground_count = float(image_foreground.sum())
+            foreground_counts.append(foreground_count)
+            slice_scores.append(
+                float(disagreement_slice.sum()) * 1.0 +
+                float(union_slice.sum()) * 0.18 +
+                foreground_count * 0.012
+            )
+
+        if not slice_scores or max(slice_scores) <= 0:
+            continue
+
+        max_foreground_count = max(foreground_counts)
+        minimum_foreground_count = max_foreground_count * 0.72
+        eligible_slice_indices = [
+            slice_index
+            for slice_index, foreground_count in enumerate(foreground_counts)
+            if foreground_count >= minimum_foreground_count
+        ]
+
+        if not eligible_slice_indices:
+            eligible_slice_indices = list(range(len(slice_scores)))
+
+        axis_best_slice_index = int(max(eligible_slice_indices, key=lambda slice_index: slice_scores[slice_index]))
+        axis_best_score = float(slice_scores[axis_best_slice_index])
+        axis_foreground_ratio = safe_ratio(foreground_counts[axis_best_slice_index], max_foreground_count)
+        display_quality = calculate_display_foreground_quality(
+            extract_display_slice(image_volume, axis, axis_best_slice_index)
+        )
+        axis_candidate_score = axis_best_score * (0.90 + axis_foreground_ratio * 0.10) * display_quality
+
+        if best_candidate is None or axis_candidate_score > best_candidate["score"]:
+            best_candidate = {
+                "axis": axis,
+                "sliceIndex": axis_best_slice_index,
+                "score": axis_candidate_score
+            }
+
+    if best_candidate is None:
+        return 2, int(image_volume.shape[2] // 2)
+
+    return int(best_candidate["axis"]), int(best_candidate["sliceIndex"])
+
+
+def extract_raw_slice(volume, axis, slice_index):
+    if axis == 0:
+        return volume[slice_index, :, :]
+
+    if axis == 1:
+        return volume[:, slice_index, :]
+
+    return volume[:, :, slice_index]
+
+
+def calculate_display_foreground_quality(image_slice):
+    foreground_mask = np.abs(image_slice) > 1e-6
+
+    if not foreground_mask.any():
+        return 0.25
+
+    row_indices, column_indices = np.where(foreground_mask)
+    foreground_area = float(foreground_mask.sum())
+    foreground_height = float(row_indices.max() - row_indices.min() + 1)
+    foreground_width = float(column_indices.max() - column_indices.min() + 1)
+    bounding_area = max(1.0, foreground_height * foreground_width)
+    fill_score = min(1.0, (foreground_area / bounding_area) / 0.70)
+    height_score = min(1.0, (foreground_height / float(image_slice.shape[0])) / 0.66)
+    width_score = min(1.0, (foreground_width / float(image_slice.shape[1])) / 0.50)
+    aspect_score = min(foreground_height / foreground_width, foreground_width / foreground_height)
+    foreground_shape_score = height_score * width_score * fill_score * aspect_score
+
+    return 0.25 + foreground_shape_score * 0.75
+
+
+def extract_display_slice(volume, axis, slice_index):
+    return np.rot90(extract_raw_slice(volume, axis, slice_index))
+
+
+def get_comparison_crop_box(image_slice, *mask_slices):
+    foreground_mask = np.abs(image_slice) > 1e-6
+
+    for mask_slice in mask_slices:
+        foreground_mask = np.logical_or(foreground_mask, mask_slice > 0)
+
+    if not foreground_mask.any():
+        return 0, image_slice.shape[0], 0, image_slice.shape[1]
+
+    row_indices, column_indices = np.where(foreground_mask)
+    row_padding = max(18, int(image_slice.shape[0] * 0.14))
+    column_padding = max(18, int(image_slice.shape[1] * 0.14))
+    row_start = max(int(row_indices.min()) - row_padding, 0)
+    row_end = min(int(row_indices.max()) + row_padding + 1, image_slice.shape[0])
+    column_start = max(int(column_indices.min()) - column_padding, 0)
+    column_end = min(int(column_indices.max()) + column_padding + 1, image_slice.shape[1])
+
+    return row_start, row_end, column_start, column_end
+
+
+def crop_slice(slice_data, crop_box):
+    row_start, row_end, column_start, column_end = crop_box
+
+    return slice_data[row_start:row_end, column_start:column_end]
+
+
+def create_mri_slice_panel(image_slice, panel_size):
+    normalized_slice = normalize_mri_slice(image_slice)
+    image = Image.fromarray((normalized_slice * 255).astype(np.uint8), mode="L").convert("RGB")
+
+    return resize_panel(image, panel_size)
+
+
+def create_mask_overlay_panel(image_slice, mask_slice, color, panel_size):
+    panel = create_mri_slice_panel(image_slice, panel_size).convert("RGBA")
+    resized_mask = resize_label_slice(mask_slice, panel_size)
+    overlay = Image.new("RGBA", panel.size, (0, 0, 0, 0))
+    overlay_pixels = overlay.load()
+
+    for y in range(panel.height):
+        for x in range(panel.width):
+            if resized_mask[y, x] <= 0:
+                continue
+
+            overlay_pixels[x, y] = (*color, 132)
+
+    panel = Image.alpha_composite(panel, overlay)
+    draw_slice_edges(panel, resized_mask, (255, 255, 255, 220))
+
+    return panel.convert("RGB")
+
+
+def create_difference_overlay_panel(image_slice, baseline_only_slice, model_only_slice, panel_size):
+    panel = create_mri_slice_panel(image_slice, panel_size).convert("RGBA")
+    resized_baseline_only = resize_label_slice(baseline_only_slice, panel_size)
+    resized_model_only = resize_label_slice(model_only_slice, panel_size)
+    overlay = Image.new("RGBA", panel.size, (0, 0, 0, 0))
+    overlay_pixels = overlay.load()
+
+    for y in range(panel.height):
+        for x in range(panel.width):
+            if resized_baseline_only[y, x] > 0:
+                overlay_pixels[x, y] = (81, 154, 255, 172)
+            elif resized_model_only[y, x] > 0:
+                overlay_pixels[x, y] = (255, 123, 67, 172)
+
+    panel = Image.alpha_composite(panel, overlay)
+    draw_slice_edges(panel, resized_baseline_only, (150, 195, 255, 230))
+    draw_slice_edges(panel, resized_model_only, (255, 190, 140, 230))
+
+    return panel.convert("RGB")
+
+
+def create_model_comparison_slice_image(labelled_panels):
+    panel_width = labelled_panels[0][1].width
+    panel_height = labelled_panels[0][1].height
+    title_height = 34
+    gap = 10
+    canvas_width = panel_width * len(labelled_panels) + gap * (len(labelled_panels) - 1)
+    canvas_height = panel_height + title_height
+    canvas = Image.new("RGB", (canvas_width, canvas_height), (248, 251, 253))
+    draw = ImageDraw.Draw(canvas)
+
+    for panel_index, (label, panel) in enumerate(labelled_panels):
+        panel_x = panel_index * (panel_width + gap)
+        draw.rounded_rectangle(
+            [panel_x, 0, panel_x + panel_width, canvas_height - 1],
+            radius=8,
+            fill=(255, 255, 255),
+            outline=(214, 228, 238)
+        )
+        draw.text((panel_x + 12, 10), label, fill=(8, 37, 61))
+        canvas.paste(panel, (panel_x, title_height))
+
+    return canvas
+
+
+def resize_panel(image, panel_size):
+    image = resize_image_to_fit_panel(image, panel_size, Image.Resampling.LANCZOS)
+    panel = Image.new("RGB", (panel_size, panel_size), (3, 12, 18))
+    paste_x = (panel_size - image.width) // 2
+    paste_y = (panel_size - image.height) // 2
+    panel.paste(image, (paste_x, paste_y))
+
+    return panel
+
+
+def resize_label_slice(label_slice, panel_size):
+    label_image = Image.fromarray(label_slice.astype(np.uint8), mode="L")
+    label_image = resize_slice_to_panel(label_image, panel_size, Image.Resampling.NEAREST)
+
+    return np.asarray(label_image, dtype=np.uint8)
+
+
+def resize_slice_to_panel(slice_image, panel_size, resample_mode):
+    image = resize_image_to_fit_panel(slice_image, panel_size, resample_mode)
+    panel = Image.new("L", (panel_size, panel_size), 0)
+    paste_x = (panel_size - image.width) // 2
+    paste_y = (panel_size - image.height) // 2
+    panel.paste(image, (paste_x, paste_y))
+
+    return panel
+
+
+def resize_image_to_fit_panel(image, panel_size, resample_mode):
+    width_scale = panel_size / image.width
+    height_scale = panel_size / image.height
+    scale = min(width_scale, height_scale)
+    resized_width = max(1, int(image.width * scale))
+    resized_height = max(1, int(image.height * scale))
+
+    return image.resize((resized_width, resized_height), resample_mode)
+
+
+def normalize_mri_slice(image_slice):
+    clean_slice = np.nan_to_num(image_slice, nan=0, posinf=0, neginf=0).astype(np.float32)
+    foreground_mask = np.abs(clean_slice) > 1e-6
+    foreground = clean_slice[foreground_mask]
+
+    if foreground.size:
+        lower_bound = np.percentile(foreground, 1)
+        upper_bound = np.percentile(foreground, 99)
+    else:
+        lower_bound = float(clean_slice.min())
+        upper_bound = float(clean_slice.max())
+
+    if upper_bound <= lower_bound:
+        upper_bound = lower_bound + 1
+
+    normalized_slice = np.clip((clean_slice - lower_bound) / (upper_bound - lower_bound), 0, 1)
+    normalized_slice[~foreground_mask] = 0
+
+    return normalized_slice
+
+
+def draw_slice_edges(panel, label_slice, color):
+    label_mask = label_slice > 0
+
+    if not label_mask.any():
+        return
+
+    from scipy import ndimage
+
+    edge_mask = np.logical_xor(label_mask, ndimage.binary_erosion(label_mask, structure=np.ones((3, 3)), border_value=0))
+    draw = ImageDraw.Draw(panel)
+
+    for y, x in np.argwhere(edge_mask):
+        draw.point((int(x), int(y)), fill=color)
+
+
+def get_region_rgb_color(region_id):
+    region_colors = {
+        "wt": (37, 151, 150),
+        "tc": (225, 83, 132),
+        "et": (236, 184, 72),
+        "combined": (185, 125, 226)
+    }
+
+    return region_colors.get(region_id, region_colors["combined"])
+
+
+def create_comparison_slice_interpretation(region_id, difference_manifest):
+    counts = difference_manifest["counts"]
+    ratios = difference_manifest["ratios"]
+
+    return {
+        "summary": (
+            f"{REGION_LABELS[region_id]} 기준으로 3D U-Net only {counts['baselineOnlyVoxels']:,} voxels, "
+            f"SwinUNETR only {counts['modelOnlyVoxels']:,} voxels가 확인됩니다."
+        ),
+        "decision": (
+            "테스트 샘플에는 정답 mask가 없으므로 더 넓은 영역을 잡은 모델을 곧바로 정답으로 볼 수 없습니다. "
+            "validation 성능, 현재 case confidence, uncertainty 위치, MRI 신호 일관성을 함께 확인해야 합니다."
+        ),
+        "disagreementUnionRatio": ratios["disagreementUnionRatio"]
     }
 
 
@@ -711,6 +1316,49 @@ def is_prediction_manifest_ready(manifest_path, checkpoint_info):
     return True
 
 
+def is_difference_manifest_ready(manifest_path, model_checkpoint, baseline_checkpoint):
+    if not manifest_path.exists():
+        return False
+
+    manifest = read_json(manifest_path)
+
+    if manifest.get("modelCheckpoint", {}).get("signature") != model_checkpoint["signature"]:
+        return False
+
+    if manifest.get("baselineCheckpoint", {}).get("signature") != baseline_checkpoint["signature"]:
+        return False
+
+    nifti_url = manifest.get("niftiUrl")
+
+    if not nifti_url:
+        return False
+
+    return get_static_cache_file_path(nifti_url).exists()
+
+
+def is_comparison_slice_manifest_ready(manifest_path, model_checkpoint, baseline_checkpoint):
+    if not manifest_path.exists():
+        return False
+
+    manifest = read_json(manifest_path)
+
+    if manifest.get("cacheVersion") != COMPARISON_SLICE_CACHE_VERSION:
+        return False
+
+    if manifest.get("modelCheckpoint", {}).get("signature") != model_checkpoint["signature"]:
+        return False
+
+    if manifest.get("baselineCheckpoint", {}).get("signature") != baseline_checkpoint["signature"]:
+        return False
+
+    image_url = manifest.get("imageUrl")
+
+    if not image_url:
+        return False
+
+    return get_static_cache_file_path(image_url).exists()
+
+
 def get_checkpoint_info(model_config):
     for checkpoint_path in model_config["checkpointCandidates"]:
         if checkpoint_path.exists():
@@ -730,12 +1378,44 @@ def normalize_case_id(case_id):
     return case_id.removesuffix(".nii.gz")
 
 
+def normalize_difference_region_id(region_id):
+    normalized_region_id = region_id.lower()
+
+    if normalized_region_id == "all":
+        return "combined"
+
+    if normalized_region_id not in REGION_LABELS:
+        raise HTTPException(status_code=422, detail=f"{region_id} region 차이 mask를 만들 수 없습니다.")
+
+    return normalized_region_id
+
+
 def get_prediction_cache_dir(model_id, case_id):
     return SEGMENTATION_CACHE_DIR / model_id / case_id / "prediction"
 
 
+def get_difference_cache_dir(model_id, case_id):
+    return SEGMENTATION_CACHE_DIR / model_id / case_id / "difference"
+
+
+def get_comparison_slice_cache_dir(model_id, case_id):
+    return SEGMENTATION_CACHE_DIR / model_id / case_id / "comparison"
+
+
 def get_prediction_nifti_url(model_id, case_id, region):
     return f"{STATIC_SEGMENTATION_CACHE_PATH}/{model_id}/{case_id}/prediction/{region}.nii.gz"
+
+
+def get_difference_nifti_url(model_id, case_id, filename):
+    return f"{STATIC_SEGMENTATION_CACHE_PATH}/{model_id}/{case_id}/difference/{filename}"
+
+
+def get_comparison_slice_image_url(model_id, case_id, filename):
+    return f"{STATIC_SEGMENTATION_CACHE_PATH}/{model_id}/{case_id}/comparison/{filename}"
+
+
+def get_static_cache_file_path(nifti_url):
+    return SEGMENTATION_CACHE_DIR / nifti_url.removeprefix(f"{STATIC_SEGMENTATION_CACHE_PATH}/")
 
 
 def clear_cache_dir(cache_dir):

@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+from importlib import import_module
 from pathlib import Path
 
 import nibabel as nib
@@ -26,7 +27,6 @@ from brain_mri_3d_tumor_segmentation.segmentation.data import (
     load_decathlon_cases,
     split_cases
 )
-from .model import create_model
 
 
 SEGMENTATION_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +36,8 @@ DEFAULT_CHECKPOINT_DIR = MODEL_DIR / "checkpoints" / "assignment_unet"
 DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "best_metric_model.pth"
 DEFAULT_CONFIG_PATH = DEFAULT_CHECKPOINT_DIR / "training_config.json"
 DEFAULT_OUTPUT_DIR = SEGMENTATION_ROOT / "segmentation_cache" / "assignment" / "score"
+DEFAULT_MODEL_FACTORY = "brain_mri_3d_tumor_segmentation.segmentation.3d_unet.model:create_model"
+DEFAULT_MODEL_TITLE = "MONAI 3D U-Net Baseline"
 REGION_IDS = ("tc", "wt", "et")
 REGION_NAME_BY_ID = dict(zip(REGION_IDS, REGION_NAMES))
 TEST_LABEL_NOTE = "Decathlon imagesTs has no labels in this dataset, so test Dice/HD95 cannot be computed locally."
@@ -46,7 +48,10 @@ def parse_args():
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument("--split-config", help="Training config used only for train/validation split selection.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--model-factory", default=DEFAULT_MODEL_FACTORY)
+    parser.add_argument("--model-title", default=DEFAULT_MODEL_TITLE)
     parser.add_argument("--splits", nargs="+", default=["train", "val"], choices=["train", "val", "test"])
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -66,10 +71,12 @@ def main():
     config_path = Path(command_args.config)
     output_dir = Path(command_args.output_dir)
     training_config = load_training_config(config_path)
-    cases_by_split = build_cases_by_split(data_dir, training_config, command_args)
+    split_config_path = Path(command_args.split_config) if command_args.split_config else config_path
+    split_config = load_training_config(split_config_path)
+    cases_by_split = build_cases_by_split(data_dir, split_config, command_args)
 
     if command_args.dry_run:
-        print(json.dumps(create_dry_run_summary(cases_by_split, data_dir, training_config), ensure_ascii=False, indent=2))
+        print(json.dumps(create_dry_run_summary(cases_by_split, data_dir, split_config), ensure_ascii=False, indent=2))
         return
 
     if not checkpoint_path.exists():
@@ -77,9 +84,17 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(command_args.device)
-    model = load_checkpoint_model(checkpoint_path, device)
+    model = load_checkpoint_model(checkpoint_path, device, command_args.model_factory)
     score_transform = create_score_transform(training_config)
-    score_summary = create_score_summary(checkpoint_path, config_path, data_dir, command_args.threshold, device)
+    score_summary = create_score_summary(
+        command_args.model_title,
+        checkpoint_path,
+        config_path,
+        split_config_path,
+        data_dir,
+        command_args.threshold,
+        device
+    )
     all_case_metric_rows = []
 
     for split_name in command_args.splits:
@@ -188,11 +203,12 @@ def create_dry_run_summary(cases_by_split, data_dir, training_config):
     }
 
 
-def create_score_summary(checkpoint_path, config_path, data_dir, threshold, device):
+def create_score_summary(model_title, checkpoint_path, config_path, split_config_path, data_dir, threshold, device):
     return {
-        "model": "MONAI 3D U-Net Baseline",
+        "model": model_title,
         "checkpoint": str(checkpoint_path),
         "trainingConfig": str(config_path),
+        "splitConfig": str(split_config_path),
         "dataDir": str(data_dir),
         "threshold": threshold,
         "device": str(device),
@@ -232,14 +248,21 @@ def resolve_device(device_name):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_checkpoint_model(checkpoint_path, device):
+def load_checkpoint_model(checkpoint_path, device, model_factory_path=DEFAULT_MODEL_FACTORY):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_state = checkpoint.get("modelState") or checkpoint
-    model = create_model().to(device)
+    model = load_model_factory(model_factory_path)().to(device)
     model.load_state_dict(model_state)
     model.eval()
 
     return model
+
+
+def load_model_factory(model_factory_path):
+    module_path, function_name = model_factory_path.split(":")
+    model_module = import_module(module_path)
+
+    return getattr(model_module, function_name)
 
 
 def score_labeled_split(split_name, cases_for_scoring, model, score_transform, device, threshold, training_config, use_amp):
