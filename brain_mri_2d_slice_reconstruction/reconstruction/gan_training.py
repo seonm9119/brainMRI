@@ -45,14 +45,14 @@ def run_gan_training(args, output_dir, create_generator, create_discriminator, m
     discriminator_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(discriminator_optimizer, T_max=args.max_epochs)
     use_amp = device.type == "cuda" and not args.no_amp
     scaler = GradScaler(device.type, enabled=use_amp)
-    best_ssim = -1.0
+    best_val_loss = float("inf")
     initialization = create_initialization_info()
     start_epoch = 1
 
     if getattr(args, "initialize_from", None):
-        best_ssim, initialization = load_gan_weights(args.initialize_from, generator, discriminator, device, "explicit_checkpoint_finetune")
+        best_val_loss, initialization = load_gan_weights(args.initialize_from, generator, discriminator, device, "explicit_checkpoint_finetune")
     elif (output_dir / "best_metric_model.pth").exists():
-        best_ssim, initialization = load_gan_weights(output_dir / "best_metric_model.pth", generator, discriminator, device, "best_checkpoint_finetune")
+        best_val_loss, initialization = load_gan_weights(output_dir / "best_metric_model.pth", generator, discriminator, device, "best_checkpoint_finetune")
 
     save_training_config(output_dir, args, model_name, model_title, train_count, val_count, device, initialization)
     early_stopping_monitor = create_early_stopping_monitor(args, [])
@@ -83,10 +83,10 @@ def run_gan_training(args, output_dir, create_generator, create_discriminator, m
 
         if epoch == args.max_epochs or epoch % args.val_interval == 0:
             val_summary = validate(generator, val_loader, reconstruction_criterion, device, use_amp)
-            is_best = val_summary["ssim"] > best_ssim
+            is_best = val_summary["valLoss"] < best_val_loss
 
             if is_best:
-                best_ssim = val_summary["ssim"]
+                best_val_loss = val_summary["valLoss"]
 
             epoch_summary.update(val_summary)
 
@@ -108,7 +108,7 @@ def run_gan_training(args, output_dir, create_generator, create_discriminator, m
                 model_name
             )
 
-        print_training_progress(epoch, args.max_epochs, epoch_summary, val_summary, best_ssim)
+        print_training_progress(epoch, args.max_epochs, epoch_summary, val_summary, best_val_loss)
 
         if early_stop_status["shouldStop"]:
             print(f"Early stopping at epoch {epoch}: {early_stop_status['reason']}")
@@ -119,6 +119,7 @@ def create_initialization_info():
     return {
         "mode": "scratch",
         "checkpointPath": None,
+        "checkpointBestValLoss": None,
         "checkpointBestSsim": None,
         "validation": None
     }
@@ -131,17 +132,18 @@ def load_gan_weights(checkpoint_path, generator, discriminator, device, mode):
     if "discriminatorState" in checkpoint:
         discriminator.load_state_dict(checkpoint["discriminatorState"])
 
-    checkpoint_ssim = get_checkpoint_ssim(checkpoint)
+    checkpoint_val_loss = get_checkpoint_val_loss(checkpoint)
     initialization = {
         "mode": mode,
         "checkpointPath": str(checkpoint_path),
-        "checkpointBestSsim": checkpoint_ssim,
+        "checkpointBestValLoss": checkpoint_val_loss if checkpoint_val_loss != float("inf") else None,
+        "checkpointBestSsim": get_checkpoint_ssim(checkpoint),
         "validation": create_checkpoint_validation_summary(checkpoint)
     }
 
     print(f"Initializing GAN weights from {checkpoint_path}")
 
-    return checkpoint_ssim, initialization
+    return checkpoint_val_loss, initialization
 
 
 def create_checkpoint_validation_summary(checkpoint):
@@ -163,6 +165,15 @@ def get_checkpoint_ssim(checkpoint):
         return validation_summary["ssim"]
 
     return -1.0
+
+
+def get_checkpoint_val_loss(checkpoint):
+    validation_summary = checkpoint.get("validation", {})
+
+    if validation_summary.get("validated") and "valLoss" in validation_summary:
+        return validation_summary["valLoss"]
+
+    return float("inf")
 
 
 def load_checkpoint(checkpoint_path, device):
@@ -396,6 +407,7 @@ def save_checkpoint(
             "generatorSchedulerState": generator_scheduler.state_dict(),
             "discriminatorSchedulerState": discriminator_scheduler.state_dict(),
             "trainingArgs": vars(args),
+            "selectionMetric": "valLoss",
             "validation": val_summary
         },
         checkpoint_path
@@ -407,7 +419,7 @@ def write_json(file_path, payload):
         json.dump(payload, json_file, ensure_ascii=False, indent=2)
 
 
-def print_training_progress(epoch, total_epochs, epoch_summary, val_summary, best_ssim):
+def print_training_progress(epoch, total_epochs, epoch_summary, val_summary, best_val_loss):
     message = (
         f"Epoch [{epoch}/{total_epochs}] "
         f"gLoss={epoch_summary['trainGeneratorLoss']:.4f} "
@@ -419,7 +431,7 @@ def print_training_progress(epoch, total_epochs, epoch_summary, val_summary, bes
             f" valLoss={val_summary['valLoss']:.4f}"
             f" ssim={val_summary['ssim']:.4f}"
             f" psnr={val_summary['psnr']:.2f}"
-            f" bestSSIM={best_ssim:.4f}"
+            f" bestValLoss={best_val_loss:.4f}"
         )
 
     print(message)
