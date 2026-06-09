@@ -47,3 +47,5 @@ brain_mri_3d_tumor_segmentation/segmentation/logs/
 Thumbs.db
 
 AI5306-PS4-Segmentation-reconstruction.md
+brain_mri_3d_tumor_segmentation/brain_3d_segmentation.md
+brain_mri_2d_slice_reconstruction/brain_2d_reconstruction.md
