@@ -27,6 +27,12 @@ RECONSTRUCTION_CACHE_DIR = RECONSTRUCTION_ROOT / "reconstruction_cache"
 STATIC_RECONSTRUCTION_CACHE_PATH = "/static/reconstruction-cache"
 DEFAULT_DATA_DIR = RECONSTRUCTION_ROOT / "brain_2d"
 MODEL_CACHE = {}
+METRIC_DEFINITIONS = [
+    {"id": "mae", "label": "MAE", "direction": "lower"},
+    {"id": "rmse", "label": "RMSE", "direction": "lower"},
+    {"id": "psnr", "label": "PSNR", "direction": "higher"},
+    {"id": "ssim", "label": "SSIM", "direction": "higher"}
+]
 
 MODEL_CONFIGS = {
     "plain_unet": {
@@ -146,6 +152,44 @@ def get_prediction(case_id, model="mamba_conv_unet", split="test"):
     return ensure_prediction_cache(selected_case, model_config, checkpoint_info)
 
 
+@router.get("/comparison/summary")
+def get_comparison_summary(models="plain_unet,mamba_conv_unet", split="test", limit="5"):
+    selected_cases, limit_label = get_summary_cases(split, limit)
+    model_configs = get_summary_model_configs(models)
+    checkpoint_infos = [get_checkpoint_info(model_config) for model_config in model_configs]
+    manifest_path = get_metric_summary_cache_path(split, limit_label, model_configs)
+
+    if is_metric_summary_manifest_ready(manifest_path, selected_cases, model_configs, checkpoint_infos):
+        metric_summary = read_json(manifest_path)
+        metric_summary["cacheHit"] = True
+        metric_summary["cacheStale"] = False
+        return metric_summary
+
+    if limit_label == "all" and is_metric_summary_manifest_usable(manifest_path, selected_cases, model_configs):
+        metric_summary = read_json(manifest_path)
+        metric_summary["cacheHit"] = True
+        metric_summary["cacheStale"] = True
+        return metric_summary
+
+    model_summaries = [
+        create_model_metric_summary(model_config, checkpoint_info, selected_cases)
+        for model_config, checkpoint_info in zip(model_configs, checkpoint_infos)
+    ]
+    metric_summary = {
+        "split": split,
+        "limit": limit_label,
+        "caseCount": len(selected_cases),
+        "caseIds": [selected_case["caseId"] for selected_case in selected_cases],
+        "metricDefinitions": METRIC_DEFINITIONS,
+        "models": model_summaries,
+        "cacheHit": False,
+        "cacheStale": False
+    }
+    write_json(manifest_path, metric_summary)
+
+    return metric_summary
+
+
 def get_selected_case(split_name, case_id):
     try:
         validate_split_name(split_name)
@@ -161,6 +205,91 @@ def get_model_config(model_id):
         raise HTTPException(status_code=404, detail=f"지원하지 않는 reconstruction model입니다: {model_id}")
 
     return MODEL_CONFIGS[normalized_model_id]
+
+
+def get_summary_model_configs(model_ids):
+    normalized_model_ids = [
+        model_id.strip().lower()
+        for model_id in str(model_ids).split(",")
+        if model_id.strip()
+    ]
+
+    if len(normalized_model_ids) < 2:
+        raise HTTPException(status_code=400, detail="comparison summary에는 최소 두 개의 model이 필요합니다.")
+
+    return [get_model_config(model_id) for model_id in normalized_model_ids]
+
+
+def get_summary_cases(split_name, limit):
+    try:
+        validate_split_name(split_name)
+        selected_cases = load_reconstruction_cases(DEFAULT_DATA_DIR, split_name)
+        case_limit, limit_label = normalize_summary_limit(limit, len(selected_cases))
+        if case_limit:
+            selected_cases = selected_cases[:case_limit]
+        return selected_cases, limit_label
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+def normalize_summary_limit(limit, total_count):
+    normalized_limit = str(limit).strip().lower()
+
+    if normalized_limit in ("all", "full"):
+        return None, "all"
+
+    case_limit = max(1, min(int(normalized_limit), total_count))
+    return case_limit, str(case_limit)
+
+
+def create_model_metric_summary(model_config, checkpoint_info, selected_cases):
+    case_metrics = [
+        {
+            "caseId": selected_case["caseId"],
+            "metrics": get_case_prediction_metrics(selected_case, model_config, checkpoint_info)
+        }
+        for selected_case in selected_cases
+    ]
+
+    return {
+        "id": model_config["id"],
+        "label": model_config["label"],
+        "checkpoint": checkpoint_info,
+        "caseMetrics": case_metrics,
+        "meanMetrics": summarize_case_metrics(case_metrics, np.mean),
+        "stdMetrics": summarize_case_metrics(case_metrics, np.std)
+    }
+
+
+def get_case_prediction_metrics(selected_case, model_config, checkpoint_info):
+    manifest_path = get_prediction_cache_dir(model_config["id"], selected_case["split"], selected_case["caseId"]) / "manifest.json"
+
+    if is_prediction_manifest_ready(manifest_path, checkpoint_info):
+        prediction_manifest = read_json(manifest_path)
+        if "metrics" in prediction_manifest:
+            return prediction_manifest["metrics"]
+
+    return run_model_inference(selected_case, model_config, checkpoint_info)["metrics"]
+
+
+def summarize_case_metrics(case_metrics, summary_function):
+    metric_names = sorted({
+        metric_name
+        for case_metric in case_metrics
+        for metric_name in case_metric["metrics"]
+    })
+    metric_summary = {}
+
+    for metric_name in metric_names:
+        metric_values = [
+            float(case_metric["metrics"][metric_name])
+            for case_metric in case_metrics
+            if metric_name in case_metric["metrics"]
+        ]
+        if metric_values:
+            metric_summary[metric_name] = float(summary_function(metric_values))
+
+    return metric_summary
 
 
 def ensure_sample_cache(selected_case):
@@ -376,12 +505,56 @@ def is_prediction_manifest_ready(manifest_path, checkpoint_info):
     )
 
 
+def is_metric_summary_manifest_ready(manifest_path, selected_cases, model_configs, checkpoint_infos):
+    if not manifest_path.exists():
+        return False
+
+    manifest = read_json(manifest_path)
+    case_ids = [selected_case["caseId"] for selected_case in selected_cases]
+
+    if manifest.get("caseIds") != case_ids:
+        return False
+
+    cached_models = {
+        model_summary.get("id"): model_summary.get("checkpoint", {})
+        for model_summary in manifest.get("models", [])
+    }
+
+    for model_config, checkpoint_info in zip(model_configs, checkpoint_infos):
+        cached_checkpoint = cached_models.get(model_config["id"], {})
+        if (
+            cached_checkpoint.get("path") != checkpoint_info["path"] or
+            cached_checkpoint.get("modifiedTime") != checkpoint_info["modifiedTime"]
+        ):
+            return False
+
+    return True
+
+
+def is_metric_summary_manifest_usable(manifest_path, selected_cases, model_configs):
+    if not manifest_path.exists():
+        return False
+
+    manifest = read_json(manifest_path)
+    case_ids = [selected_case["caseId"] for selected_case in selected_cases]
+    model_ids = [model_config["id"] for model_config in model_configs]
+    cached_model_ids = [model_summary.get("id") for model_summary in manifest.get("models", [])]
+
+    return manifest.get("caseIds") == case_ids and cached_model_ids == model_ids
+
+
 def get_sample_cache_dir(split_name, case_id):
     return RECONSTRUCTION_CACHE_DIR / "samples" / split_name / str(case_id)
 
 
 def get_prediction_cache_dir(model_id, split_name, case_id):
     return RECONSTRUCTION_CACHE_DIR / model_id / split_name / str(case_id) / "prediction"
+
+
+def get_metric_summary_cache_path(split_name, limit_label, model_configs):
+    model_key = "-".join([model_config["id"] for model_config in model_configs])
+
+    return RECONSTRUCTION_CACHE_DIR / "metric_summaries" / split_name / str(limit_label) / model_key / "manifest.json"
 
 
 def get_sample_image_url(split_name, case_id, file_name):
