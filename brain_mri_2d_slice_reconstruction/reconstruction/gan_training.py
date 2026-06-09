@@ -57,6 +57,24 @@ def run_gan_training(args, output_dir, create_generator, create_discriminator, m
     save_training_config(output_dir, args, model_name, model_title, train_count, val_count, device, initialization)
     early_stopping_monitor = create_early_stopping_monitor(args, [])
 
+    if should_refresh_checkpoint_baseline(initialization):
+        val_summary = validate(generator, val_loader, reconstruction_criterion, device, use_amp)
+        best_val_loss = val_summary["valLoss"]
+        save_checkpoint(
+            output_dir / "best_metric_model.pth",
+            generator,
+            discriminator,
+            generator_optimizer,
+            discriminator_optimizer,
+            generator_scheduler,
+            discriminator_scheduler,
+            args,
+            0,
+            val_summary,
+            model_name
+        )
+        print_baseline_validation(val_summary)
+
     for epoch in range(start_epoch, args.max_epochs + 1):
         train_summary = train_one_epoch(
             generator,
@@ -121,6 +139,7 @@ def create_initialization_info():
         "checkpointPath": None,
         "checkpointBestValLoss": None,
         "checkpointBestSsim": None,
+        "checkpointSelectionMetric": None,
         "validation": None
     }
 
@@ -138,12 +157,20 @@ def load_gan_weights(checkpoint_path, generator, discriminator, device, mode):
         "checkpointPath": str(checkpoint_path),
         "checkpointBestValLoss": checkpoint_val_loss if checkpoint_val_loss != float("inf") else None,
         "checkpointBestSsim": get_checkpoint_ssim(checkpoint),
+        "checkpointSelectionMetric": checkpoint.get("selectionMetric"),
         "validation": create_checkpoint_validation_summary(checkpoint)
     }
 
     print(f"Initializing GAN weights from {checkpoint_path}")
 
     return checkpoint_val_loss, initialization
+
+
+def should_refresh_checkpoint_baseline(initialization):
+    if initialization["mode"] == "scratch":
+        return False
+
+    return initialization.get("checkpointSelectionMetric") != "valLoss"
 
 
 def create_checkpoint_validation_summary(checkpoint):
@@ -417,6 +444,16 @@ def save_checkpoint(
 def write_json(file_path, payload):
     with file_path.open("w", encoding="utf-8") as json_file:
         json.dump(payload, json_file, ensure_ascii=False, indent=2)
+
+
+def print_baseline_validation(val_summary):
+    print(
+        "Baseline checkpoint validation "
+        f"valLoss={val_summary['valLoss']:.4f}"
+        f" ssim={val_summary['ssim']:.4f}"
+        f" psnr={val_summary['psnr']:.2f}"
+        f" bestValLoss={val_summary['valLoss']:.4f}"
+    )
 
 
 def print_training_progress(epoch, total_epochs, epoch_summary, val_summary, best_val_loss):

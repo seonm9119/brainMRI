@@ -43,6 +43,12 @@ def run_training(args, output_dir, create_model, model_name, model_title):
     save_training_config(output_dir, args, model_name, model_title, train_count, val_count, device, initialization)
     early_stopping_monitor = create_early_stopping_monitor(args, [])
 
+    if should_refresh_checkpoint_baseline(initialization):
+        val_summary = validate(model, val_loader, criterion, device, use_amp)
+        best_val_loss = val_summary["valLoss"]
+        save_checkpoint(output_dir / "best_metric_model.pth", model, optimizer, scheduler, args, 0, val_summary, model_name)
+        print_baseline_validation(val_summary)
+
     for epoch in range(start_epoch, args.max_epochs + 1):
         train_summary = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp)
         scheduler.step()
@@ -82,6 +88,7 @@ def create_initialization_info():
         "checkpointPath": None,
         "checkpointBestValLoss": None,
         "checkpointBestSsim": None,
+        "checkpointSelectionMetric": None,
         "validation": None
     }
 
@@ -95,12 +102,20 @@ def load_model_weights(checkpoint_path, model, device, mode):
         "checkpointPath": str(checkpoint_path),
         "checkpointBestValLoss": checkpoint_val_loss if checkpoint_val_loss != float("inf") else None,
         "checkpointBestSsim": get_checkpoint_ssim(checkpoint),
+        "checkpointSelectionMetric": checkpoint.get("selectionMetric"),
         "validation": create_checkpoint_validation_summary(checkpoint)
     }
 
     print(f"Initializing model weights from {checkpoint_path}")
 
     return checkpoint_val_loss, initialization
+
+
+def should_refresh_checkpoint_baseline(initialization):
+    if initialization["mode"] == "scratch":
+        return False
+
+    return initialization.get("checkpointSelectionMetric") != "valLoss"
 
 
 def create_checkpoint_validation_summary(checkpoint):
@@ -309,6 +324,16 @@ def save_checkpoint(checkpoint_path, model, optimizer, scheduler, args, epoch, v
 def write_json(file_path, payload):
     with file_path.open("w", encoding="utf-8") as json_file:
         json.dump(payload, json_file, ensure_ascii=False, indent=2)
+
+
+def print_baseline_validation(val_summary):
+    print(
+        "Baseline checkpoint validation "
+        f"valLoss={val_summary['valLoss']:.4f}"
+        f" ssim={val_summary['ssim']:.4f}"
+        f" psnr={val_summary['psnr']:.2f}"
+        f" bestValLoss={val_summary['valLoss']:.4f}"
+    )
 
 
 def print_training_progress(epoch, total_epochs, epoch_summary, val_summary, best_val_loss):
