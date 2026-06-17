@@ -4,6 +4,7 @@ services:
       context: .
     image: brain-mri:latest
     container_name: brain-mri
+    gpus: all
     networks:
       - default
       - awesome_default
@@ -19,7 +20,7 @@ services:
       - BRAINMRI_GPT_INTERPRETATION_API_URL=${BRAINMRI_GPT_INTERPRETATION_API_URL:-http://192.168.0.21:8003/brain-mri/segmentation/interpret}
       - BRAINMRI_GPT_INTERPRETATION_TIMEOUT=${BRAINMRI_GPT_INTERPRETATION_TIMEOUT:-120}
     volumes:
-      - ./brain_mri_3d_tumor_segmentation/sample:/app/brain_mri_3d_tumor_segmentation/sample:ro
+      - ./brain_mri_3d_tumor_segmentation/decathlon/imagesTs:/app/brain_mri_3d_tumor_segmentation/decathlon/imagesTs:ro
       - ./brain_mri_3d_tumor_segmentation/segmentation/3d_unet/checkpoints:/app/brain_mri_3d_tumor_segmentation/segmentation/3d_unet/checkpoints:ro
       - ./brain_mri_3d_tumor_segmentation/segmentation/enhanced_model/checkpoints:/app/brain_mri_3d_tumor_segmentation/segmentation/enhanced_model/checkpoints:ro
       - ./brain_mri_3d_tumor_segmentation/nifti_cache:/app/brain_mri_3d_tumor_segmentation/nifti_cache

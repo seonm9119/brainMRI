@@ -203,6 +203,7 @@ def ensure_prediction_cache(selected_case, model_config):
 
     if is_prediction_manifest_ready(manifest_path, checkpoint_info):
         prediction_manifest = read_json(manifest_path)
+        prediction_manifest = ensure_prediction_region_focus(cache_dir, prediction_manifest)
         prediction_manifest["checkpoint"] = checkpoint_info
         prediction_manifest["cacheHit"] = True
         return prediction_manifest
@@ -502,6 +503,45 @@ def create_quantitative_summary(original_volume, probabilities, region_masks, un
     }
 
 
+def create_region_focus_summary(region_volume):
+    region_mask = region_volume.astype(bool)
+    voxel_count = int(region_mask.sum())
+
+    if not voxel_count:
+        return {
+            "voxelCount": 0,
+            "bboxVoxel": None,
+            "centerVoxel": None,
+            "centerFrac": [0.5, 0.5, 0.5],
+            "extentFrac": [1.0, 1.0, 1.0],
+            "scale": 1.42
+        }
+
+    coordinates = np.argwhere(region_mask)
+    min_voxel = coordinates.min(axis=0).astype(float)
+    max_voxel = coordinates.max(axis=0).astype(float)
+    center_voxel = coordinates.mean(axis=0)
+    shape = np.asarray(region_volume.shape, dtype=float)
+    extent_voxel = np.maximum(max_voxel - min_voxel + 1, 1)
+    center_frac = (center_voxel + 0.5) / shape
+    extent_frac = extent_voxel / shape
+    max_extent = float(extent_frac.max())
+    scale = float(np.clip(0.72 / max(max_extent, 0.08), 1.42, 3.0))
+
+    return {
+        "voxelCount": voxel_count,
+        "bboxVoxel": {
+            "min": [int(voxel) for voxel in min_voxel],
+            "max": [int(voxel) for voxel in max_voxel],
+            "size": [int(voxel) for voxel in extent_voxel]
+        },
+        "centerVoxel": [round(float(voxel), 3) for voxel in center_voxel],
+        "centerFrac": [round(float(fraction), 6) for fraction in center_frac],
+        "extentFrac": [round(float(fraction), 6) for fraction in extent_frac],
+        "scale": round(scale, 3)
+    }
+
+
 def create_brain_foreground_mask(original_volume):
     clean_volume = np.nan_to_num(original_volume, nan=0, posinf=0, neginf=0)
 
@@ -758,11 +798,13 @@ def normalize_input_volume(channel_first_volume):
 def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_info, prediction_data):
     overlays = {}
     region_counts = {}
+    region_focus = {}
 
     for region_id, region_volume in prediction_data["regions"].items():
         region_path = cache_dir / f"{region_id}.nii.gz"
         save_region_nifti(region_path, region_volume, prediction_data["affine"], prediction_data["header"])
         region_counts[region_id] = int(region_volume.astype(bool).sum())
+        region_focus[region_id] = create_region_focus_summary(region_volume)
         overlays[region_id] = {
             "id": region_id,
             "label": REGION_LABELS[region_id],
@@ -784,6 +826,7 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
         "threshold": model_config["threshold"],
         "regions": overlays,
         "regionCounts": region_counts,
+        "regionFocus": region_focus,
         "confidenceSummary": prediction_data["confidenceSummary"],
         "quantitativeSummary": prediction_data["quantitativeSummary"],
         "llmInterpretation": prediction_data["llmInterpretation"],
@@ -791,6 +834,31 @@ def save_prediction_cache(cache_dir, selected_case, model_config, checkpoint_inf
         "probabilityRange": prediction_data["probabilityRange"],
         "baseNifti": get_modality_nifti_response(selected_case["caseId"], "flair")
     }
+    write_json(cache_dir / "manifest.json", prediction_manifest)
+
+    return prediction_manifest
+
+
+def ensure_prediction_region_focus(cache_dir, prediction_manifest):
+    if prediction_manifest.get("regionFocus"):
+        return prediction_manifest
+
+    region_focus = {}
+
+    for region_id in ("wt", "tc", "et"):
+        region_path = cache_dir / f"{region_id}.nii.gz"
+
+        if not region_path.exists():
+            continue
+
+        region_image = nib.load(str(region_path))
+        region_volume = np.asarray(region_image.dataobj)
+        region_focus[region_id] = create_region_focus_summary(region_volume)
+
+    if not region_focus:
+        return prediction_manifest
+
+    prediction_manifest["regionFocus"] = region_focus
     write_json(cache_dir / "manifest.json", prediction_manifest)
 
     return prediction_manifest

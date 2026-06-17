@@ -7,11 +7,20 @@ from fastapi import APIRouter, HTTPException, Query
 
 
 SEGMENTATION_ROOT = Path(__file__).resolve().parents[1]
-SAMPLE_DIR = SEGMENTATION_ROOT / "sample"
-SELECTED_CASES_PATH = SAMPLE_DIR / "selected_cases.json"
+DECATHLON_TEST_IMAGE_DIR = SEGMENTATION_ROOT / "decathlon" / "imagesTs"
 NIFTI_CACHE_DIR = SEGMENTATION_ROOT / "nifti_cache"
 STATIC_NIFTI_CACHE_PATH = "/static/nifti-cache"
 INPUT_VOLUME_FIT_RENDER_SCALE = 0.72
+DEFAULT_SELECTED_CASES = {
+    "source": "Decathlon Task01_BrainTumour imagesTs",
+    "modalities": [
+        {"id": "flair", "label": "FLAIR", "channelIndex": 0},
+        {"id": "t1w", "label": "T1w", "channelIndex": 1},
+        {"id": "t1gd", "label": "T1Gd", "channelIndex": 2},
+        {"id": "t2w", "label": "T2w", "channelIndex": 3}
+    ],
+    "cases": []
+}
 router = APIRouter(prefix="/api/brain-mri/segmentation", tags=["3D MRI Volume"])
 
 
@@ -78,10 +87,22 @@ def get_modality_nifti_response(case_id, modality):
 
 
 def load_selected_cases():
-    if not SELECTED_CASES_PATH.exists():
-        raise HTTPException(status_code=500, detail="selected_cases.json 파일을 찾을 수 없습니다.")
+    selected_cases = DEFAULT_SELECTED_CASES
+    selected_case_ids = {selected_case["caseId"] for selected_case in selected_cases.get("cases", [])}
+    decathlon_test_cases = [
+        {
+            "caseId": test_image_path.name.removesuffix(".nii.gz"),
+            "fileName": test_image_path.name,
+            "relativePath": str(test_image_path.relative_to(SEGMENTATION_ROOT))
+        }
+        for test_image_path in sorted(DECATHLON_TEST_IMAGE_DIR.glob("*.nii.gz"))
+        if test_image_path.name.removesuffix(".nii.gz") not in selected_case_ids
+    ]
 
-    return read_json(SELECTED_CASES_PATH)
+    return {
+        **selected_cases,
+        "cases": [*selected_cases.get("cases", []), *decathlon_test_cases]
+    }
 
 
 def normalize_case_id(case_id):
