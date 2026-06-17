@@ -1,10 +1,75 @@
 # Brain MRI Projects
 
-Brain MRI를 대상으로 segmentation과 reconstruction 문제를 다룬 의료 AI 포트폴리오입니다. 현재 문서는 두 축으로 구성되어 있으며, 이 README에서는 먼저 2D MRI reconstruction 프로젝트를 정리합니다.
+Brain MRI를 대상으로 segmentation과 reconstruction 문제를 다룬 의료 AI 포트폴리오입니다. 모델 학습 결과를 notebook 안에만 남기지 않고, FastAPI serving과 frontend 시연 화면까지 연결해 실제로 설명 가능한 의료 AI 데모 형태로 구성했습니다.
 
 ## Segmentation
 
-3D Brain MRI tumor segmentation 파트는 별도 정리 예정입니다.
+### 3D Brain Tumor Segmentation
+
+이 프로젝트는 BraTS 3D brain MRI volume에서 종양 관련 영역을 voxel 단위로 분할하는 segmentation 실험입니다. 입력은 FLAIR, T1w, T1CE, T2w 네 가지 MRI modality를 쌓은 4-channel 3D volume이고, 출력은 의료 영상 분할에서 자주 사용하는 WT, TC, ET 세 가지 composite tumor region입니다.
+
+| Region | Meaning | Clinical Role |
+| --- | --- | --- |
+| WT | Whole Tumor | 부종, 비증강 종양, 조영증강 종양을 포함한 전체 종양 영향 범위 |
+| TC | Tumor Core | 부종을 제외한 종양 중심부 |
+| ET | Enhancing Tumor | 조영증강되는 활성 종양 영역 |
+
+### Problem Setting
+
+뇌종양 MRI는 하나의 영상만으로 판단하기 어렵습니다. FLAIR는 부종과 병변 주변 신호를 잘 보여주고, T1w는 해부학적 구조를 제공합니다. T1CE는 조영증강 활성 종양을 확인하는 데 중요하며, T2w는 수분 함량과 병변 확산 범위를 보완합니다. 따라서 모델은 단일 slice classification이 아니라 4-channel 3D volume의 공간적 문맥을 함께 학습해야 합니다.
+
+과제 제출용 baseline은 MONAI 3D U-Net으로 구성했습니다. U-Net은 의료 영상 segmentation에서 강한 기본 구조이지만, convolution 중심 구조만으로는 넓은 종양 주변 문맥이나 애매한 경계 영역의 불확실성을 충분히 설명하기 어렵다고 보았습니다. 그래서 portfolio 개선 버전에서는 SwinUNETR 기반 모델에 flip TTA를 붙여 예측 mask뿐 아니라 confidence와 uncertainty까지 함께 제공하도록 구성했습니다.
+
+![Confidence-aware SwinUNETR architecture](./assets/segmentation-model-architecture.png)
+
+### Experiment Setup
+
+| Item | Setup |
+| --- | --- |
+| Dataset | Decathlon Task01 BrainTumour / BraTS-style 3D MRI |
+| Input shape | `[240, 240, 155, 4]` |
+| Input channels | FLAIR, T1w, T1CE, T2w |
+| Output regions | WT, TC, ET |
+| Baseline | MONAI 3D U-Net |
+| Enhanced model | Confidence-aware SwinUNETR + flip TTA |
+| Evaluation split | Validation 24 cases |
+
+### Quantitative Result
+
+같은 validation 24 cases 기준으로 과제 제출용 3D U-Net과 개선 버전 SwinUNETR를 다시 비교했습니다.
+
+| Region | 3D U-Net Dice | SwinUNETR Dice | Delta | 3D U-Net HD95 | SwinUNETR HD95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WT | 91.0% | 91.5% | +0.5p | 3.4 mm | 3.7 mm |
+| TC | 84.6% | 84.8% | +0.3p | 6.1 mm | 6.2 mm |
+| ET | 82.7% | 84.4% | +1.7p | 2.0 mm | 1.8 mm |
+
+SwinUNETR는 세 region 모두에서 Dice가 개선되었고, 특히 ET Dice와 ET HD95가 함께 좋아졌습니다. 다만 WT/TC의 HD95는 baseline이 약간 더 낮았기 때문에, 개선 버전의 주장은 단순히 모든 수치가 압도적으로 좋아졌다는 것이 아닙니다. 이 프로젝트에서 강조한 지점은 Dice 개선과 함께 confidence, uncertainty, mask difference를 같이 보여주는 해석 가능한 inference pipeline입니다.
+
+### Visual Evaluation Interface
+
+서비스 화면에서는 기본 case 결과를 frontend asset으로 제공해 즉시 확인할 수 있게 했고, `다른 이미지 테스트`를 선택한 경우에만 FastAPI segmentation inference를 호출하도록 분리했습니다. 사용자는 같은 화면에서 3D mask viewer, case별 정량 요약, LLM 기반 한국어 결과 해석, U-Net과 SwinUNETR의 mask 차이, validation summary를 함께 확인할 수 있습니다.
+
+![Brain MRI segmentation case review](./assets/segmentation-case-review.png)
+
+### API-Backed Test Flow
+
+새 test MRI를 선택하면 frontend는 파일명을 `{case_id}`로 사용해 FastAPI endpoint에 요청합니다. backend는 Decathlon test image 폴더에서 같은 파일명을 찾고, 4-channel MRI volume을 읽어 모델 inference를 수행합니다. 응답에는 NiiVue에서 바로 렌더링할 base MRI와 segmentation mask URL, WT/TC/ET voxel count, 부피, 뇌 대비 비율, 평균 확률, LLM 해석에 사용할 quantitative summary가 포함됩니다.
+
+### Implementation Notes
+
+- FastAPI backend에서 case 목록, modality NIfTI 변환, segmentation prediction, model difference, comparison slice API를 제공합니다.
+- 기본 demo case는 frontend asset으로 고정해 페이지 로딩 즉시 결과를 볼 수 있게 했습니다.
+- 다른 이미지 테스트를 선택할 때만 backend inference를 호출해 실제 API serving 흐름을 보여줍니다.
+- backend inference는 GPU 컨테이너에서 실행되며, PyTorch CUDA device를 사용하도록 구성했습니다.
+- output mask는 NiiVue 3D viewer로 렌더링하고, TC/WT/ET 버튼으로 관심 region을 중앙에 맞춰 회전하도록 만들었습니다.
+- 개선 모델은 prediction mask 외에도 confidence, uncertainty, U-Net 대비 차이 영역을 함께 제공합니다.
+
+### What I Focused On
+
+이 segmentation 파트에서 가장 신경 쓴 부분은 “정답 mask와 비슷한 결과를 냈다”에서 끝내지 않는 것이었습니다. 의료 영상 분할 결과는 실제로 어디가 종양인지, 어떤 영역이 불확실한지, baseline과 개선 모델이 왜 다르게 판단했는지를 설명할 수 있어야 합니다. 그래서 모델 결과를 3D viewer, 정량 테이블, uncertainty 해석, LLM 설명, API 테스트 플로우까지 하나의 화면에 묶었습니다.
+
+결과적으로 이 프로젝트는 3D U-Net baseline을 구현한 과제 제출물에서 출발해, SwinUNETR 기반 개선 모델과 해석 가능한 serving UI까지 확장한 end-to-end segmentation 작업입니다.
 
 ## Reconstruction
 
