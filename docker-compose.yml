@@ -9,7 +9,7 @@ services:
       - default
       - awesome_default
     user: "${BRAINMRI_UID:-1000}:${BRAINMRI_GID:-1000}"
-    restart: unless-stopped
+    restart: "no"
     ports:
       - "127.0.0.1:8010:8010"
     environment:
