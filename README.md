@@ -2,6 +2,119 @@
 
 Brain MRI를 대상으로 segmentation과 reconstruction 문제를 다룬 의료 AI 포트폴리오입니다. 모델 학습 결과를 notebook 안에만 남기지 않고, FastAPI serving과 frontend 시연 화면까지 연결해 실제로 설명 가능한 의료 AI 데모 형태로 구성했습니다.
 
+## API Usage
+
+이 프로젝트의 모델 serving API는 FastAPI 기반 `brain-mri` 컨테이너에서 실행됩니다. 컨테이너는 자동 재시작하지 않도록 설정되어 있으므로 필요할 때 직접 올려서 사용합니다.
+
+```bash
+cd /home/nami/repo/gpt_analysis/project/brainMRI
+docker compose up -d brainmri
+```
+
+중지할 때는 다음 명령을 사용합니다.
+
+```bash
+cd /home/nami/repo/gpt_analysis/project/brainMRI
+docker compose stop brainmri
+```
+
+기본 API 주소는 로컬 기준 `http://127.0.0.1:8010`입니다. 컨테이너가 정상 실행 중인지 먼저 health check로 확인합니다.
+
+```bash
+curl http://127.0.0.1:8010/api/health
+```
+
+정상 응답 예시는 다음과 같습니다.
+
+```json
+{
+  "status": "ok",
+  "service": "brainMRI"
+}
+```
+
+### Segmentation API
+
+Segmentation API는 `/api/brain-mri/segmentation` prefix를 사용합니다. `case_id`는 Decathlon test image 파일명에서 `.nii.gz`를 제거한 값입니다.
+
+사용 가능한 test case 목록을 조회합니다.
+
+```bash
+curl http://127.0.0.1:8010/api/brain-mri/segmentation/cases
+```
+
+특정 case의 modality NIfTI를 생성하거나 조회합니다. `modality`는 `flair`, `t1w`, `t1gd`, `t2w` 중 하나입니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/segmentation/cases/BRATS_001/modality-nifti?modality=flair"
+```
+
+Segmentation prediction을 실행하거나 캐시된 결과를 조회합니다. `model`은 `assignment` 또는 `enhanced`를 사용합니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/segmentation/cases/BRATS_001/prediction?model=enhanced"
+```
+
+개선 모델과 baseline의 mask 차이를 조회합니다. `region`은 `wt`, `tc`, `et` 중 하나입니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/segmentation/cases/BRATS_001/prediction-difference?model=enhanced&baseline=assignment&region=tc"
+```
+
+프론트 비교 패널에서 사용하는 2D comparison slice를 조회합니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/segmentation/cases/BRATS_001/prediction-comparison-slice?model=enhanced&baseline=assignment&region=tc"
+```
+
+응답의 `niftiUrl`, `maskUrl`, `imageUrl` 값은 `/static/nifti-cache`, `/static/segmentation-cache` 아래의 정적 파일 경로입니다.
+
+### Reconstruction API
+
+Reconstruction API는 `/api/brain-mri/reconstruction` prefix를 사용합니다. `case_id`는 reconstruction test split의 case 번호입니다.
+
+사용 가능한 reconstruction model 정보를 조회합니다.
+
+```bash
+curl http://127.0.0.1:8010/api/brain-mri/reconstruction/models
+```
+
+Dataset split 요약을 조회합니다.
+
+```bash
+curl http://127.0.0.1:8010/api/brain-mri/reconstruction/dataset/summary
+```
+
+Test case 목록을 조회합니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/reconstruction/cases?split=test&limit=24"
+```
+
+특정 case의 입력 FLAIR/T1w/T2w와 target T1Gd sample을 조회합니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/reconstruction/cases/3/sample?split=test"
+```
+
+특정 model의 synthetic T1Gd prediction을 실행하거나 캐시된 결과를 조회합니다. `model`은 `plain_unet`, `mamba_conv_unet`, `plain_gan`, `resvit_gan` 중 하나입니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/reconstruction/cases/3/prediction?model=mamba_conv_unet&split=test"
+```
+
+두 모델의 metric summary를 조회합니다. `limit=5`는 기본 데모용 5개 case, `limit=all`은 전체 test split 기준입니다.
+
+```bash
+curl "http://127.0.0.1:8010/api/brain-mri/reconstruction/comparison/summary?models=plain_unet,mamba_conv_unet&split=test&limit=5"
+```
+
+응답의 reconstruction image URL은 `/static/reconstruction-cache` 아래의 정적 파일 경로입니다.
+
+### Cache Behavior
+
+Segmentation과 reconstruction API는 요청 시 필요한 cache 폴더와 파일을 다시 생성합니다. 기본 프론트 데모 5개 case는 `awesome/front/src/medical_ai/.../cache`에 정적 asset으로 들어가 있으므로, `brain-mri` 컨테이너가 내려가 있어도 기본 결과 화면은 표시됩니다. `다른 이미지 테스트`처럼 새 case를 API로 추론하는 기능은 `brain-mri` 컨테이너가 실행 중일 때만 사용할 수 있습니다.
+
 ## Segmentation
 
 ### 3D Brain Tumor Segmentation
