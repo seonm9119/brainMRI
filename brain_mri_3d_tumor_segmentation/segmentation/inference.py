@@ -11,7 +11,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query
 from PIL import Image, ImageDraw
 
-from brain_mri_3d_tumor_segmentation.volume_3d.volume import (
+from brain_mri_3d_tumor_segmentation.volume import (
     find_selected_case,
     get_case_path,
     get_modality_nifti_response,

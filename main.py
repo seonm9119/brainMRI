@@ -12,7 +12,7 @@ from brain_mri_3d_tumor_segmentation.segmentation.inference import (
     SEGMENTATION_CACHE_DIR,
     router as inference_router
 )
-from brain_mri_3d_tumor_segmentation.volume_3d.volume import (
+from brain_mri_3d_tumor_segmentation.volume import (
     NIFTI_CACHE_DIR,
     router as volume_router
 )
